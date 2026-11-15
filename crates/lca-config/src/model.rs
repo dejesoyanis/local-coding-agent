@@ -27,6 +27,9 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// Default per-request Ollama HTTP timeout, in seconds.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 5;
 
+/// Default TCP connect timeout for one Ollama call, in seconds.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
+
 /// Largest accepted context window, in tokens.
 pub const MAX_CONTEXT_WINDOW: u32 = 1_048_576;
 
@@ -62,6 +65,7 @@ pub struct AgentConfig {
     max_steps: u32,
     timeout: Duration,
     request_timeout: Duration,
+    connect_timeout: Duration,
 }
 
 /// Values that are safe to print and to record in diagnostics.
@@ -85,6 +89,8 @@ pub struct ConfigSummary {
     pub timeout_secs: u64,
     /// HTTP timeout in seconds.
     pub request_timeout_secs: u64,
+    /// TCP connect timeout in seconds.
+    pub connect_timeout_secs: u64,
 }
 
 impl AgentConfig {
@@ -104,6 +110,7 @@ impl AgentConfig {
             max_steps: limits.max_steps,
             timeout: limits.timeout,
             request_timeout: limits.request_timeout,
+            connect_timeout: limits.connect_timeout,
         }
     }
 
@@ -161,6 +168,12 @@ impl AgentConfig {
         self.request_timeout
     }
 
+    /// TCP connect timeout for one Ollama call.
+    #[must_use]
+    pub const fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
     /// Copy of the fields that diagnostics are allowed to show.
     #[must_use]
     pub fn summary(&self) -> ConfigSummary {
@@ -174,6 +187,7 @@ impl AgentConfig {
             max_steps: self.max_steps,
             timeout_secs: self.timeout.as_secs(),
             request_timeout_secs: self.request_timeout.as_secs(),
+            connect_timeout_secs: self.connect_timeout.as_secs(),
         }
     }
 }
@@ -196,6 +210,7 @@ pub(crate) struct RawOllama {
     pub(crate) context_window: Option<u32>,
     pub(crate) generation_limit: Option<u32>,
     pub(crate) request_timeout_secs: Option<u64>,
+    pub(crate) connect_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -216,6 +231,7 @@ pub(crate) struct ResolvedLimits {
     pub(crate) max_steps: u32,
     pub(crate) timeout: Duration,
     pub(crate) request_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
 }
 
 pub(crate) fn check_endpoint(value: &str) -> Result<CheckedEndpoint, ConfigError> {
@@ -349,9 +365,17 @@ pub(crate) fn check_timeout_secs(value: u64) -> Result<Duration, ConfigError> {
 }
 
 pub(crate) fn check_request_timeout_secs(value: u64) -> Result<Duration, ConfigError> {
+    check_bounded_secs(value, "ollama.request_timeout_secs")
+}
+
+pub(crate) fn check_connect_timeout_secs(value: u64) -> Result<Duration, ConfigError> {
+    check_bounded_secs(value, "ollama.connect_timeout_secs")
+}
+
+fn check_bounded_secs(value: u64, field: &'static str) -> Result<Duration, ConfigError> {
     if value == 0 || value > MAX_REQUEST_TIMEOUT_SECS {
         return Err(ConfigError::InvalidValue {
-            field: "ollama.request_timeout_secs",
+            field,
             message: format!("must be from 1 through {MAX_REQUEST_TIMEOUT_SECS} seconds"),
         });
     }

@@ -4,6 +4,7 @@ members = [
     "apps/lca-cli",
     "crates/lca-core",
     "crates/lca-config",
+    "crates/lca-model-runtime",
     "crates/lca-ollama",
     "crates/lca-tools",
 ]

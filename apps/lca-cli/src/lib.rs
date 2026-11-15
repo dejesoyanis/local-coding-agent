@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+mod ask;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -41,8 +43,28 @@ pub fn init_tracing() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-/// Parses `args` (including argv0) and runs the selected command.
-pub fn dispatch<I, S>(args: I) -> CommandOutput
+/// Parsed invocation. `Ask` is streamed by the binary; the other commands are buffered.
+#[derive(Debug)]
+pub enum Invocation {
+    /// A command whose entire output is available before the process writes it.
+    Buffered(CommandOutput),
+    /// A prompt that must be streamed to the caller's stdout.
+    Ask(AskCommand),
+}
+
+/// Arguments for `lca ask`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskCommand {
+    /// Configuration file selected by `--config`, or `lca.toml`.
+    pub config: PathBuf,
+    /// Model override from `--model`.
+    pub model: Option<String>,
+    /// Prompt text, before trimming.
+    pub prompt: String,
+}
+
+/// Parses `args` (including argv0) without running a model.
+pub fn interpret<I, S>(args: I) -> Invocation
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString> + Clone,
@@ -50,19 +72,45 @@ where
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
-        Err(error) => return clap_output(error),
+        Err(error) => return Invocation::Buffered(clap_output(error)),
     };
     let config_path = cli.config.unwrap_or_else(|| PathBuf::from("lca.toml"));
     match cli.command {
-        Command::Status => status(&config_path),
+        Command::Status => Invocation::Buffered(status(&config_path)),
         Command::Config {
             action: ConfigAction::Validate,
-        } => validate(&config_path),
+        } => Invocation::Buffered(validate(&config_path)),
         Command::Workspace {
             action: WorkspaceAction::Info,
-        } => workspace_info(&config_path),
+        } => Invocation::Buffered(workspace_info(&config_path)),
+        Command::Ask { model, prompt } => Invocation::Ask(AskCommand {
+            config: config_path,
+            model,
+            prompt,
+        }),
     }
 }
+
+/// Parses `args` and runs a buffered command.
+///
+/// `ask` is rejected here because this function would have to hold the whole answer.
+/// The `lca` binary streams that command instead.
+pub fn dispatch<I, S>(args: I) -> CommandOutput
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString> + Clone,
+{
+    match interpret(args) {
+        Invocation::Buffered(output) => output,
+        Invocation::Ask(_) => CommandOutput {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: "lca: ask is streamed by the lca binary\n".to_owned(),
+        },
+    }
+}
+
+pub use ask::run_ask;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -93,6 +141,15 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+    /// Stream an answer from the configured local model.
+    Ask {
+        /// Model name. Overrides the configuration file for this call.
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
+        /// Prompt text.
+        #[arg(value_name = "PROMPT")]
+        prompt: String,
     },
 }
 
@@ -146,6 +203,11 @@ fn status(config_path: &Path) -> CommandOutput {
                 &mut stdout,
                 "request_timeout_secs",
                 &config.request_timeout().as_secs().to_string(),
+            );
+            push_line(
+                &mut stdout,
+                "connect_timeout_secs",
+                &config.connect_timeout().as_secs().to_string(),
             );
             push_line(&mut stdout, "ollama", availability.as_str());
             push_line(
@@ -249,6 +311,11 @@ fn push_summary(out: &mut String, config_path: &Path, config: &AgentConfig) {
         out,
         "request_timeout_secs",
         &config.request_timeout().as_secs().to_string(),
+    );
+    push_line(
+        out,
+        "connect_timeout_secs",
+        &config.connect_timeout().as_secs().to_string(),
     );
     push_line(
         out,

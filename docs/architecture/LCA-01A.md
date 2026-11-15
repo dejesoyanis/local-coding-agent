@@ -2,6 +2,8 @@
 
 This milestone is the local coding agent's library and command-line foundation. It loads configuration, models the agent lifecycle, checks a local Ollama server, and defines workspace-scoped tool authorization. It does not edit files, start processes, call tools, or run an agent loop.
 
+Chat generation, streaming, and the backend-neutral runtime live in [LCA-01B](LCA-01B.md). The health check described here is unchanged.
+
 `lca-test` stays an independent benchmark. The workspace excludes it. `opencode.json` stays at the repository root, where OpenCode reads it. Ollama Modelfiles live under `models/ollama/` and are not read at runtime.
 
 ## Workspace layout
@@ -11,6 +13,7 @@ Cargo.toml
 apps/lca-cli
 crates/lca-core
 crates/lca-config
+crates/lca-model-runtime
 crates/lca-ollama
 crates/lca-tools
 docs/architecture/LCA-01A.md
@@ -26,17 +29,21 @@ The workspace uses Cargo resolver 3 and Rust edition 2024. Every crate forbids `
 lca-cli
   -> lca-core
   -> lca-config
+  -> lca-model-runtime
   -> lca-ollama
+       -> lca-model-runtime
 
 lca-core        domain only
 lca-config      TOML, validation, canonical workspace root
-lca-ollama      native Ollama HTTP checks
+lca-model-runtime
+                backend-neutral generation contracts (LCA-01B)
+lca-ollama      native Ollama health checks and the generation adapter
 lca-tools       tool model and authorization
 ```
 
-`lca-core` does not depend on Ollama, the filesystem, or the CLI. `lca-config`, `lca-ollama`, and `lca-tools` do not depend on each other. `lca-cli` is the composition root and does not depend on `lca-tools`, so the binary cannot execute a tool. A later milestone can add that dependency when an executor is allowed to succeed.
+`lca-core` does not depend on Ollama, the filesystem, or the CLI. `lca-config` and `lca-tools` do not depend on the runtime crates. `lca-model-runtime` does not depend on Ollama. `lca-cli` is the composition root and does not depend on `lca-tools`, so the binary cannot execute a tool. A later milestone can add that dependency when an executor is allowed to succeed.
 
-External libraries are limited to `thiserror`, `tracing`, `uuid`, `serde`, `toml`, `url`, `ureq`, `clap`, and `tracing-subscriber`.
+The libraries used by this foundation are `thiserror`, `tracing`, `uuid`, `serde`, `toml`, `url`, `ureq`, `clap`, and `tracing-subscriber`. LCA-01B adds `async-trait`, `futures-util`, `reqwest`, and `tokio` for generation. The health client still uses `ureq`.
 
 ## Crate responsibilities
 
@@ -63,7 +70,7 @@ Validation rejects:
 - a generation limit outside `1..=context_window`
 - `max_steps` outside `1..=10_000`
 - `timeout_secs` outside `1..=86400`
-- `request_timeout_secs` outside `1..=3600`
+- `request_timeout_secs` and `connect_timeout_secs` outside `1..=3600`
 - configuration files larger than 64 KiB
 - unknown fields
 
@@ -96,6 +103,7 @@ The client applies the configured timeout to connect, read, and write, disables 
 | `lca status` | Prints the idle lifecycle, config, model, endpoint, workspace, and Ollama readiness. Exit 0 only when the config is valid and the model is advertised. |
 | `lca config validate` | Validates the file. It does not contact Ollama. |
 | `lca workspace info` | Prints the canonical workspace root. |
+| `lca ask` | Streams one local generation. Behavior is specified in [LCA-01B](LCA-01B.md). |
 
 `--config PATH` selects the file. When it is omitted, the command reads `lca.toml` from the working directory. A missing Ollama server is `ollama: unavailable` and exit code 1. An invalid configuration is `ollama: not_checked`; status does not contact the network in that case. Neither path panics.
 
@@ -110,6 +118,7 @@ model = "lca-30b-agent"
 context_window = 8192
 generation_limit = 2048
 request_timeout_secs = 5
+connect_timeout_secs = 5
 
 [limits]
 max_steps = 32
@@ -125,6 +134,7 @@ Defaults when a field is omitted:
 | `ollama.context_window` | `8192` |
 | `ollama.generation_limit` | `2048` |
 | `ollama.request_timeout_secs` | `5` |
+| `ollama.connect_timeout_secs` | `5` |
 | `limits.max_steps` | `32` |
 | `limits.timeout_secs` | `300` |
 
@@ -154,6 +164,7 @@ generation_limit: 2048
 max_steps: 32
 timeout_secs: 300
 request_timeout_secs: 5
+connect_timeout_secs: 5
 ollama: unavailable
 ollama_detail: request to http://127.0.0.1:11434/api/version failed: ...
 readiness: not_ready
@@ -186,7 +197,7 @@ Any other pair, including a transition to the current status, returns `AgentErro
 - Mutating tools and process execution are hard-denied. The only executor returns an error.
 - The CLI does not depend on the tool crate and does not interpret model output as a command.
 - Ollama endpoints cannot carry a username, password, path, query, or fragment. Redirects are disabled. Response bodies are capped and are not copied into status text.
-- A non-loopback endpoint is accepted and a warning is logged. The operator chooses the host. The default is loopback.
+- A non-loopback endpoint is accepted by the loader and a warning is logged. `lca status` still probes that host. Generation refuses it; see [LCA-01B](LCA-01B.md). The default is loopback.
 - Configuration files are not a secret store. This schema has no secret fields. Tracing records the error kind and the safe summary (workspace root, endpoint, model, numeric limits). It does not record raw TOML. Credential errors use a fixed sentence.
 - The agent timeout and step budget are not enforced because there is no loop yet. The HTTP timeout is enforced on the health check.
 
@@ -195,7 +206,7 @@ Any other pair, including a transition to the current status, returns `AgentErro
 - Autonomous file reading, writing, and editing
 - Process or shell execution
 - An agent loop, planning, or multi-step runs
-- Model generation, chat, streaming, and tool-calling protocols
+- Model generation, chat, and streaming (implemented in [LCA-01B](LCA-01B.md); tool-calling protocols remain absent)
 - An interactive REPL
 - Enforcement of `max_steps` and `limits.timeout_secs`
 - Secret storage or credential brokers

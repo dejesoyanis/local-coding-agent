@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::ConfigError;
 use crate::model::{
-    AgentConfig, DEFAULT_CONTEXT_WINDOW, DEFAULT_GENERATION_LIMIT, DEFAULT_MAX_STEPS,
-    DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL, DEFAULT_REQUEST_TIMEOUT_SECS,
-    DEFAULT_TIMEOUT_SECS, MAX_CONFIG_BYTES, RawConfig, ResolvedLimits, check_context_window,
-    check_endpoint, check_generation_limit, check_max_steps, check_model,
+    AgentConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_CONTEXT_WINDOW, DEFAULT_GENERATION_LIMIT,
+    DEFAULT_MAX_STEPS, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL, DEFAULT_REQUEST_TIMEOUT_SECS,
+    DEFAULT_TIMEOUT_SECS, MAX_CONFIG_BYTES, RawConfig, ResolvedLimits, check_connect_timeout_secs,
+    check_context_window, check_endpoint, check_generation_limit, check_max_steps, check_model,
     check_request_timeout_secs, check_timeout_secs,
 };
 use crate::pathutil::simplify_verbatim;
@@ -27,6 +27,7 @@ use crate::pathutil::simplify_verbatim;
 /// context_window = 8192
 /// generation_limit = 2048
 /// request_timeout_secs = 5
+/// connect_timeout_secs = 5
 ///
 /// [limits]
 /// max_steps = 32
@@ -51,6 +52,7 @@ pub fn load_from_path(path: &Path) -> Result<AgentConfig, ConfigError> {
                 max_steps = summary.max_steps,
                 timeout_secs = summary.timeout_secs,
                 request_timeout_secs = summary.request_timeout_secs,
+                connect_timeout_secs = summary.connect_timeout_secs,
                 "configuration loaded"
             );
             Ok(config)
@@ -99,6 +101,11 @@ fn load_inner(path: &Path) -> Result<AgentConfig, ConfigError> {
             .request_timeout_secs
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
     )?;
+    let connect_timeout = check_connect_timeout_secs(
+        raw.ollama
+            .connect_timeout_secs
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+    )?;
     let max_steps = check_max_steps(raw.limits.max_steps.unwrap_or(DEFAULT_MAX_STEPS))?;
     let timeout = check_timeout_secs(raw.limits.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))?;
 
@@ -118,6 +125,7 @@ fn load_inner(path: &Path) -> Result<AgentConfig, ConfigError> {
             max_steps,
             timeout,
             request_timeout,
+            connect_timeout,
         },
     ))
 }
@@ -215,9 +223,9 @@ mod tests {
     use super::*;
     use crate::error::ConfigError;
     use crate::model::{
-        DEFAULT_CONTEXT_WINDOW, DEFAULT_GENERATION_LIMIT, DEFAULT_MAX_STEPS,
-        DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL, DEFAULT_REQUEST_TIMEOUT_SECS,
-        DEFAULT_TIMEOUT_SECS, MAX_CONFIG_BYTES,
+        DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_CONTEXT_WINDOW, DEFAULT_GENERATION_LIMIT,
+        DEFAULT_MAX_STEPS, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
+        DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, MAX_CONFIG_BYTES,
     };
     use crate::pathutil::simplify_verbatim;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -283,6 +291,10 @@ mod tests {
         assert_eq!(
             config.request_timeout().as_secs(),
             DEFAULT_REQUEST_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.connect_timeout().as_secs(),
+            DEFAULT_CONNECT_TIMEOUT_SECS
         );
     }
 
@@ -387,6 +399,7 @@ mod tests {
                 "invalid_value",
             ),
             ("request_timeout_secs = 0\n", "invalid_value"),
+            ("connect_timeout_secs = 0\n", "invalid_value"),
         ];
         for (ollama, kind) in cases {
             let path = write_config(

@@ -1,0 +1,21 @@
+[package]
+name = "lca-model-runtime"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Backend-neutral contracts for the local model runtime."
+
+[features]
+# Enables the shared adapter contract harness. It is not required at runtime.
+contract = []
+
+[dependencies]
+async-trait = "0.1"
+futures-util = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

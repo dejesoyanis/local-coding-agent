@@ -8,11 +8,17 @@ autobins = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
 lca-config = { path = "../../crates/lca-config" }
 lca-core = { path = "../../crates/lca-core" }
+lca-model-runtime = { path = "../../crates/lca-model-runtime" }
 lca-ollama = { path = "../../crates/lca-ollama" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "ansi"] }
+
+[dev-dependencies]
+async-trait = "0.1"
 
 [lib]
 name = "lca_cli"

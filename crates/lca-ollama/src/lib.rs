@@ -1,16 +1,26 @@
-//! Minimal client for the local Ollama HTTP API.
+//! Local Ollama adapter.
 //!
-//! This milestone only checks that the server is reachable and that a model is advertised.
-//! It does not generate text and it does not implement tool calling. Unit tests use an
-//! in-process TCP stub or no network at all; they do not require Ollama to be running.
+//! [`HttpOllamaClient`] is the LCA-01A health check. It calls `/api/version` and `/api/tags`
+//! and does not generate text. [`OllamaModelRuntime`] is the generation adapter: it implements
+//! the backend-neutral [`lca_model_runtime::ModelRuntime`] contract with chat, streaming, and
+//! capability lookup. Neither client calls tools or downloads models.
+//!
+//! Unit and integration tests use an in-process HTTP stub or no network at all. They do not
+//! require Ollama to be running. The ignored smoke test is the only optional live call.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod client;
 mod dto;
+mod endpoint;
 mod error;
+mod map;
+mod ndjson;
+mod runtime;
 
 pub use client::{HttpOllamaClient, OllamaClient};
 pub use dto::{RemoteModel, TagsResponse, VersionResponse, model_is_present, names_match};
 pub use error::{OllamaAvailability, OllamaError};
+pub use ndjson::MAX_STREAM_FRAME_BYTES;
+pub use runtime::{OllamaModelRuntime, OllamaRuntimeConfig};
