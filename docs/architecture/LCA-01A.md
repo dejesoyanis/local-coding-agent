@@ -2,7 +2,7 @@
 
 This milestone is the local coding agent's library and command-line foundation. It loads configuration, models the agent lifecycle, checks a local Ollama server, and defines workspace-scoped tool authorization. It does not edit files, start processes, call tools, or run an agent loop.
 
-`lca-test` stays an independent benchmark. The workspace excludes it. `opencode.json` and the Modelfiles are not part of this foundation and are not read at runtime.
+`lca-test` stays an independent benchmark. The workspace excludes it. `opencode.json` stays at the repository root, where OpenCode reads it. Ollama Modelfiles live under `models/ollama/` and are not read at runtime.
 
 ## Workspace layout
 
@@ -14,6 +14,7 @@ crates/lca-config
 crates/lca-ollama
 crates/lca-tools
 docs/architecture/LCA-01A.md
+models/ollama/     Ollama Modelfiles, not read by this foundation
 lca-test/          excluded benchmark, not a workspace member
 ```
 
