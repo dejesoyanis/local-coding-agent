@@ -1,0 +1,26 @@
+[package]
+name = "lca-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Command-line interface for the local coding agent foundation."
+autobins = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+lca-config = { path = "../../crates/lca-config" }
+lca-core = { path = "../../crates/lca-core" }
+lca-ollama = { path = "../../crates/lca-ollama" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "ansi"] }
+
+[lib]
+name = "lca_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lca"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "lca-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Domain types for the local coding agent lifecycle."
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

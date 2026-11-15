@@ -1,0 +1,19 @@
+[package]
+name = "lca-config"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Typed configuration loading and validation for the local coding agent."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tracing = "0.1"
+
+[lints]
+workspace = true

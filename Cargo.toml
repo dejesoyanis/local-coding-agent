@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/lca-cli",
+    "crates/lca-core",
+    "crates/lca-config",
+    "crates/lca-ollama",
+    "crates/lca-tools",
+]
+# lca-test is an independent benchmark project and must stay outside this workspace.
+exclude = ["lca-test"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

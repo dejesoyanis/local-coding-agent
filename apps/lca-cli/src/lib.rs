@@ -1,0 +1,318 @@
+//! Command-line composition root for the local coding agent foundation.
+//!
+//! `status`, `config validate`, and `workspace info` load configuration and report it.
+//! Status probes Ollama and reports an unavailable server without panicking. This binary
+//! does not start an agent loop and does not execute tools.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand};
+use lca_config::{AgentConfig, ConfigError, load_from_path};
+use lca_core::AgentLifecycle;
+use lca_ollama::{HttpOllamaClient, OllamaAvailability, OllamaClient};
+
+/// Text produced by one invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutput {
+    /// Process exit code.
+    pub exit_code: u8,
+    /// Standard output, ending in a newline when it is not empty.
+    pub stdout: String,
+    /// Standard error, ending in a newline when it is not empty.
+    pub stderr: String,
+}
+
+/// Installs a stderr tracing subscriber. Missing `RUST_LOG` stays at warn.
+///
+/// The default level does not record configuration file contents. Callers that set
+/// `RUST_LOG` still only receive the structured fields emitted by the libraries.
+pub fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// Parses `args` (including argv0) and runs the selected command.
+pub fn dispatch<I, S>(args: I) -> CommandOutput
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString> + Clone,
+{
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => return clap_output(error),
+    };
+    let config_path = cli.config.unwrap_or_else(|| PathBuf::from("lca.toml"));
+    match cli.command {
+        Command::Status => status(&config_path),
+        Command::Config {
+            action: ConfigAction::Validate,
+        } => validate(&config_path),
+        Command::Workspace {
+            action: WorkspaceAction::Info,
+        } => workspace_info(&config_path),
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "lca",
+    version,
+    about = "Local coding agent foundation",
+    arg_required_else_help = true
+)]
+struct Cli {
+    /// TOML configuration file. Defaults to lca.toml in the working directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Show the agent state, model, endpoint, workspace, and Ollama readiness.
+    Status,
+    /// Inspect configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Inspect the configured workspace.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// Load the configuration file and report validation errors.
+    Validate,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceAction {
+    /// Print the canonical workspace root.
+    Info,
+}
+
+fn status(config_path: &Path) -> CommandOutput {
+    // LCA-01A has no agent loop. Status reports the initial lifecycle state only.
+    let agent_status = AgentLifecycle::new().status();
+    match load_from_path(config_path) {
+        Ok(config) => {
+            let availability = probe(&config);
+            let ready = matches!(availability, OllamaAvailability::Ready { .. });
+            let mut stdout = String::new();
+            push_line(&mut stdout, "agent_status", agent_status.as_str());
+            push_line(&mut stdout, "config", "valid");
+            push_line(&mut stdout, "config_file", &display_path(config_path));
+            push_line(&mut stdout, "model", config.model());
+            push_line(&mut stdout, "endpoint", config.endpoint());
+            push_line(
+                &mut stdout,
+                "workspace_root",
+                &config.workspace_root().display().to_string(),
+            );
+            push_line(
+                &mut stdout,
+                "context_window",
+                &config.context_window().to_string(),
+            );
+            push_line(
+                &mut stdout,
+                "generation_limit",
+                &config.generation_limit().to_string(),
+            );
+            push_line(&mut stdout, "max_steps", &config.max_steps().to_string());
+            push_line(
+                &mut stdout,
+                "timeout_secs",
+                &config.timeout().as_secs().to_string(),
+            );
+            push_line(
+                &mut stdout,
+                "request_timeout_secs",
+                &config.request_timeout().as_secs().to_string(),
+            );
+            push_line(&mut stdout, "ollama", availability.as_str());
+            push_line(
+                &mut stdout,
+                "ollama_detail",
+                &availability.detail(config.model()),
+            );
+            push_line(
+                &mut stdout,
+                "readiness",
+                if ready { "ready" } else { "not_ready" },
+            );
+            CommandOutput {
+                exit_code: if ready { 0 } else { 1 },
+                stdout,
+                stderr: String::new(),
+            }
+        }
+        Err(error) => {
+            tracing::debug!(error_kind = error.kind(), "status configuration rejected");
+            let mut stdout = String::new();
+            push_line(&mut stdout, "agent_status", agent_status.as_str());
+            push_line(&mut stdout, "config", "invalid");
+            push_line(&mut stdout, "config_file", &display_path(config_path));
+            push_line(&mut stdout, "config_detail", &error.to_string());
+            push_line(&mut stdout, "model", "unavailable");
+            push_line(&mut stdout, "endpoint", "unavailable");
+            push_line(&mut stdout, "workspace_root", "unavailable");
+            push_line(&mut stdout, "ollama", "not_checked");
+            push_line(
+                &mut stdout,
+                "ollama_detail",
+                "configuration is invalid; endpoint was not contacted",
+            );
+            push_line(&mut stdout, "readiness", "not_ready");
+            CommandOutput {
+                exit_code: 1,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+    }
+}
+
+fn validate(config_path: &Path) -> CommandOutput {
+    match load_from_path(config_path) {
+        Ok(config) => {
+            let mut stdout = String::new();
+            push_summary(&mut stdout, config_path, &config);
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+        Err(error) => error_output(&error),
+    }
+}
+
+fn workspace_info(config_path: &Path) -> CommandOutput {
+    match load_from_path(config_path) {
+        Ok(config) => {
+            let mut stdout = String::new();
+            push_line(&mut stdout, "config_file", &display_path(config_path));
+            push_line(
+                &mut stdout,
+                "workspace_root",
+                &config.workspace_root().display().to_string(),
+            );
+            push_line(&mut stdout, "exists", "true");
+            push_line(&mut stdout, "is_directory", "true");
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+        Err(error) => error_output(&error),
+    }
+}
+
+fn push_summary(out: &mut String, config_path: &Path, config: &AgentConfig) {
+    push_line(out, "config", "valid");
+    push_line(out, "config_file", &display_path(config_path));
+    push_line(
+        out,
+        "workspace_root",
+        &config.workspace_root().display().to_string(),
+    );
+    push_line(out, "model", config.model());
+    push_line(out, "endpoint", config.endpoint());
+    push_line(out, "context_window", &config.context_window().to_string());
+    push_line(
+        out,
+        "generation_limit",
+        &config.generation_limit().to_string(),
+    );
+    push_line(out, "max_steps", &config.max_steps().to_string());
+    push_line(out, "timeout_secs", &config.timeout().as_secs().to_string());
+    push_line(
+        out,
+        "request_timeout_secs",
+        &config.request_timeout().as_secs().to_string(),
+    );
+    push_line(
+        out,
+        "loopback_endpoint",
+        if config.loopback_endpoint() {
+            "true"
+        } else {
+            "false"
+        },
+    );
+}
+
+fn probe(config: &AgentConfig) -> OllamaAvailability {
+    match HttpOllamaClient::new(config.endpoint(), config.request_timeout()) {
+        Ok(client) => client.check_model(config.model()),
+        Err(error) => OllamaAvailability::Unavailable {
+            message: error.to_string(),
+        },
+    }
+}
+
+fn error_output(error: &ConfigError) -> CommandOutput {
+    tracing::debug!(error_kind = error.kind(), "command rejected configuration");
+    CommandOutput {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: format!("lca: {error}\n"),
+    }
+}
+
+fn clap_output(error: clap::Error) -> CommandOutput {
+    let code = u8::try_from(error.exit_code()).unwrap_or(2);
+    let message = finish_line(error.to_string());
+    if error.use_stderr() {
+        CommandOutput {
+            exit_code: code,
+            stdout: String::new(),
+            stderr: message,
+        }
+    } else {
+        CommandOutput {
+            exit_code: code,
+            stdout: message,
+            stderr: String::new(),
+        }
+    }
+}
+
+fn push_line(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str(": ");
+    out.push_str(value);
+    out.push('\n');
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn finish_line(mut text: String) -> String {
+    if text.is_empty() || text.ends_with('\n') {
+        text
+    } else {
+        text.push('\n');
+        text
+    }
+}
