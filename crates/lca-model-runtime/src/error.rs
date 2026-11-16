@@ -62,6 +62,8 @@ pub enum RuntimeError {
     ProtocolViolation {
         /// What was wrong. The raw payload is omitted.
         message: String,
+        /// Specific classification. [`Self::kind`] stays `protocol_violation`.
+        code: &'static str,
     },
 
     /// A stream ended before the backend emitted a terminal completion.
@@ -87,6 +89,19 @@ impl RuntimeError {
             Self::BackendFailure { .. } => "backend_failure",
             Self::ProtocolViolation { .. } => "protocol_violation",
             Self::StreamInterrupted { .. } => "stream_interrupted",
+        }
+    }
+
+    /// Specific classification.
+    ///
+    /// For [`Self::ProtocolViolation`] this can be narrower than [`Self::kind`].
+    /// `invalid_http_json` means the HTTP body was not JSON. It is not the assistant
+    /// document, which the controller classifies as `invalid_json`.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::ProtocolViolation { code, .. } => code,
+            _ => self.kind(),
         }
     }
 
@@ -139,10 +154,18 @@ impl RuntimeError {
         Self::BackendFailure { status, message }
     }
 
-    /// Response that cannot be interpreted.
+    /// Response that cannot be interpreted. The code is `protocol_violation`.
     pub fn protocol(message: impl Into<String>) -> Self {
+        Self::protocol_code("protocol_violation", message)
+    }
+
+    /// Response that cannot be interpreted, with a specific [`Self::code`].
+    ///
+    /// [`Self::kind`] remains `protocol_violation`. The message must not include a body.
+    pub fn protocol_code(code: &'static str, message: impl Into<String>) -> Self {
         Self::ProtocolViolation {
             message: message.into(),
+            code,
         }
     }
 
@@ -192,11 +215,12 @@ impl PartialEq for RuntimeError {
                 },
             ) => status == other_status && message == other_message,
             (
-                Self::ProtocolViolation { message },
+                Self::ProtocolViolation { message, code },
                 Self::ProtocolViolation {
                     message: other_message,
+                    code: other_code,
                 },
-            ) => message == other_message,
+            ) => message == other_message && code == other_code,
             (Self::StreamInterrupted { .. }, Self::StreamInterrupted { .. }) => true,
             _ => false,
         }

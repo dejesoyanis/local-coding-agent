@@ -119,6 +119,44 @@ async fn http_status_codes_map_to_runtime_errors_without_retry() {
 }
 
 #[tokio::test]
+async fn a_rejected_json_format_is_not_retried() {
+    let mock = spawn(|request| {
+        assert!(
+            request.contains("\"format\":\"json\""),
+            "JSON output was not requested"
+        );
+        json_body(
+            400,
+            "{\"error\":\"json format is not supported for this model\"}",
+        )
+    })
+    .await;
+    let runtime = connect_at(
+        mock.endpoint(),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    let request = GenerationRequest::try_new(
+        "lca-30b-agent",
+        vec![Message::user("ping")],
+        GenerationOptions {
+            timeout: Some(Duration::from_secs(1)),
+            response_format: lca_model_runtime::ResponseFormat::Json,
+            ..GenerationOptions::default()
+        },
+    )
+    .expect("request");
+    let error = runtime.generate(request).await.expect_err("rejected");
+    assert_eq!(error.kind(), "invalid_request", "{error}");
+    assert!(
+        error.to_string().contains("json format is not supported"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("native"), "{error}");
+    assert_eq!(mock.hits(), 1, "JSON format rejection was retried");
+}
+
+#[tokio::test]
 async fn connection_reset_is_a_connection_error() {
     // This host drops SYNs to closed ports instead of sending RST, so a closed port
     // surfaces as a connect timeout. An accepted socket closed with linger 0 is a
@@ -225,6 +263,7 @@ async fn redirects_are_not_followed() {
 #[tokio::test]
 async fn empty_and_invalid_success_bodies_are_protocol_errors() {
     for body in ["", "{"] {
+        let empty = body.is_empty();
         let body = body.to_owned();
         let mock = spawn(move |_| json_body(200, &body)).await;
         let runtime = connect_at(
@@ -237,6 +276,13 @@ async fn empty_and_invalid_success_bodies_are_protocol_errors() {
             .await
             .expect_err("body");
         assert_eq!(error.kind(), "protocol_violation", "{error}");
+        let code = if empty {
+            "protocol_violation"
+        } else {
+            "invalid_http_json"
+        };
+        assert_eq!(error.code(), code, "{error}");
+        assert!(!error.to_string().contains("assistant content"), "{error}");
         assert!(!error.to_string().contains('{'), "{error}");
     }
 }

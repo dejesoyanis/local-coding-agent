@@ -465,6 +465,8 @@ impl SingleTurnAgentController {
                 Vec::new(),
                 ResponseFormat::Json,
             ),
+            // Unconfirmed JSON mode stays text. The bounded loop requests JSON separately.
+            // This single-turn path must not follow that change.
             SelectedProtocol::StructuredJson {
                 json_mode_confirmed: false,
             } => (
@@ -898,6 +900,11 @@ mod tests {
         let request = request_of(&runtime);
         assert!(request.tools().is_empty());
         assert_eq!(request.response_format(), ResponseFormat::Text);
+        assert!(!report.protocol().json_mode_confirmed());
+        let system = request.system().expect("system");
+        assert!(system.contains("protocol_version 1"), "{system}");
+        assert!(!system.contains("final_answer"), "{system}");
+        assert!(!system.contains("protocol_version is always 2"), "{system}");
     }
 
     #[tokio::test]

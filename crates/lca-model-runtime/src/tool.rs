@@ -28,10 +28,11 @@ pub enum ResponseFormat {
     /// Ordinary assistant text.
     #[default]
     Text,
-    /// Ask the backend for a JSON document when it confirms JSON mode.
+    /// Ask the backend to constrain assistant text to JSON.
     ///
-    /// This is not a guarantee that the document matches the action protocol.
-    /// The controller still validates the bytes.
+    /// Setting this value does not mark JSON mode as a confirmed model capability.
+    /// The Ollama adapter sends the string `json`, which requests syntactic JSON.
+    /// It does not send a JSON Schema. The controller still validates the bytes.
     Json,
 }
 

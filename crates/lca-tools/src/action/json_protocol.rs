@@ -10,8 +10,9 @@ pub const PROTOCOL_VERSION: u64 = 1;
 
 /// Version of the multi-turn JSON document.
 ///
-/// Version 2 adds an optional `final_answer` string. It is required when `actions` is
-/// empty and forbidden when `actions` is not empty. [`parse_action_document`] rejects it.
+/// Version 2 adds a `final_answer` string. It is required and must contain a
+/// non-whitespace character when `actions` is empty, and it is forbidden when
+/// `actions` is not empty. [`parse_action_document`] rejects version 2.
 pub const AGENT_PROTOCOL_VERSION: u64 = 2;
 
 /// Largest accepted JSON document, in bytes.
@@ -93,8 +94,10 @@ pub enum JsonProtocolError {
         /// Configured limit.
         limit: usize,
     },
-    /// The bytes are not one JSON value.
-    #[error("response was not valid JSON")]
+    /// The assistant content is not one JSON value.
+    ///
+    /// This is not an invalid Ollama HTTP body. That failure uses `invalid_http_json`.
+    #[error("assistant content was not valid JSON")]
     InvalidJson,
     /// The JSON value is not an object.
     #[error("JSON action document must be an object")]
@@ -151,6 +154,9 @@ pub enum JsonProtocolError {
     /// `final_answer` is present and is not a string.
     #[error("final_answer must be a string")]
     InvalidFinalAnswer,
+    /// Protocol version 2 has an empty action list and a blank `final_answer`.
+    #[error("final_answer must be a non-empty string")]
+    EmptyFinalAnswer,
     /// Protocol version 2 has an empty action list and no `final_answer`.
     #[error("an empty action list requires final_answer")]
     MissingFinalAnswer,
@@ -175,6 +181,7 @@ impl JsonProtocolError {
             Self::TooManyActions { .. } => "too_many_actions",
             Self::FinalAnswerConflict => "final_answer_conflict",
             Self::InvalidFinalAnswer => "invalid_final_answer",
+            Self::EmptyFinalAnswer => "empty_final_answer",
             Self::MissingFinalAnswer => "missing_final_answer",
         }
     }
@@ -252,10 +259,15 @@ fn interpret_document(value: Value, allow_v2: bool) -> Result<ActionDocument, Js
         Some(_) => return Err(JsonProtocolError::InvalidFinalAnswer),
     };
     if version == AGENT_PROTOCOL_VERSION {
-        if parsed.is_empty() && final_answer.is_none() {
-            return Err(JsonProtocolError::MissingFinalAnswer);
-        }
-        if !parsed.is_empty() && final_answer.is_some() {
+        if parsed.is_empty() {
+            match final_answer.as_deref() {
+                None => return Err(JsonProtocolError::MissingFinalAnswer),
+                Some(text) if text.trim().is_empty() => {
+                    return Err(JsonProtocolError::EmptyFinalAnswer);
+                }
+                Some(_) => {}
+            }
+        } else if final_answer.is_some() {
             return Err(JsonProtocolError::FinalAnswerConflict);
         }
     }
@@ -461,6 +473,90 @@ mod tests {
                 .expect_err("v1 field")
                 .kind(),
             "unknown_field"
+        );
+    }
+
+    #[test]
+    fn agent_documents_match_the_version_two_examples_and_reject_the_rest() {
+        let tool = r#"{"protocol_version":2,"actions":[{"tool":"read_file","arguments":{"path":"Cargo.toml"}}]}"#;
+        let parsed = parse_agent_document(tool).expect("tool");
+        assert_eq!(parsed.version(), 2);
+        assert_eq!(parsed.actions().len(), 1);
+        assert_eq!(parsed.actions()[0].tool(), "read_file");
+        assert_eq!(parsed.actions()[0].arguments()["path"], "Cargo.toml");
+        assert_eq!(parsed.final_answer(), None);
+        assert_eq!(
+            parse_action_document(tool)
+                .expect_err("single turn stays on version 1")
+                .kind(),
+            "unsupported_version"
+        );
+
+        let answer = r#"{"protocol_version":2,"actions":[],"final_answer":"Rust Ownership regelt die eindeutige Zuständigkeit für Werte."}"#;
+        let parsed = parse_agent_document(answer).expect("answer");
+        assert!(parsed.actions().is_empty());
+        assert_eq!(
+            parsed.final_answer(),
+            Some("Rust Ownership regelt die eindeutige Zuständigkeit für Werte.")
+        );
+
+        let invalid = parse_agent_document("not json {").expect_err("invalid");
+        assert_eq!(invalid.kind(), "invalid_json");
+        assert_eq!(invalid.to_string(), "assistant content was not valid JSON");
+        assert!(!invalid.to_string().contains("not json"), "{invalid}");
+
+        let fenced = "```json\n{\"protocol_version\":2,\"actions\":[],\"final_answer\":\"x\"}\n```";
+        assert_eq!(
+            parse_agent_document(fenced).expect_err("fence").kind(),
+            "markdown"
+        );
+
+        assert_eq!(
+            parse_agent_document(
+                r#"{"protocol_version":2,"actions":[],"final_answer":"x","note":"y"}"#
+            )
+            .expect_err("field")
+            .kind(),
+            "unknown_field"
+        );
+        assert_eq!(
+            parse_agent_document(r#"{"protocol_version":9,"actions":[]}"#)
+                .expect_err("version")
+                .kind(),
+            "unsupported_version"
+        );
+        assert_eq!(
+            parse_agent_document(r#"{"protocol_version":"2","actions":[],"final_answer":"x"}"#)
+                .expect_err("type")
+                .kind(),
+            "invalid_version"
+        );
+        assert_eq!(
+            parse_agent_document(r#"{"protocol_version":2,"actions":[],"final_answer":""}"#)
+                .expect_err("empty")
+                .kind(),
+            "empty_final_answer"
+        );
+        assert_eq!(
+            parse_agent_document(r#"{"protocol_version":2,"actions":[],"final_answer":" \n\t "}"#)
+                .expect_err("blank")
+                .kind(),
+            "empty_final_answer"
+        );
+        let kept = parse_agent_document(
+            r#"{"protocol_version":2,"actions":[],"final_answer":"  still text  "}"#,
+        )
+        .expect("padded");
+        assert_eq!(kept.final_answer(), Some("  still text  "));
+
+        let bad_arguments = parse_agent_document(
+            r#"{"protocol_version":2,"actions":[{"tool":"read_file","arguments":{"path":"a.rs"},"id":1}]}"#,
+        )
+        .expect_err("arguments");
+        assert_eq!(bad_arguments.kind(), "invalid_action");
+        assert!(
+            bad_arguments.to_string().contains("unknown field"),
+            "{bad_arguments}"
         );
     }
 }

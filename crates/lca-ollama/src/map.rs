@@ -217,8 +217,12 @@ pub(crate) fn capabilities_from_show(
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err(RuntimeError::protocol("response body was empty"));
     }
-    let show: ShowResponse = serde_json::from_slice(bytes)
-        .map_err(|_| RuntimeError::protocol("model information was not valid JSON"))?;
+    let show: ShowResponse = serde_json::from_slice(bytes).map_err(|_| {
+        RuntimeError::protocol_code(
+            "invalid_http_json",
+            "Ollama model information was not valid JSON",
+        )
+    })?;
     Ok(map_show(model, show))
 }
 
@@ -292,6 +296,10 @@ fn ollama_tools(request: &GenerationRequest) -> Vec<OllamaTool> {
         .collect()
 }
 
+/// Maps a requested response shape onto Ollama's `format` field.
+///
+/// `Some("json")` is the syntactic JSON mode. This function does not send a JSON Schema
+/// object, and it does not report that the model confirmed JSON mode.
 fn json_format(request: &GenerationRequest) -> Option<&'static str> {
     match request.response_format() {
         ResponseFormat::Json => Some("json"),
@@ -376,7 +384,12 @@ fn parse_chunk(bytes: &[u8]) -> Result<ChatChunk, RuntimeError> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err(RuntimeError::protocol("response body was empty"));
     }
-    serde_json::from_slice(bytes).map_err(|_| RuntimeError::protocol("response was not valid JSON"))
+    serde_json::from_slice(bytes).map_err(|_| {
+        RuntimeError::protocol_code(
+            "invalid_http_json",
+            "Ollama HTTP response was not valid JSON",
+        )
+    })
 }
 
 fn content_of(chunk: &ChatChunk) -> String {
@@ -653,6 +666,11 @@ mod tests {
 
         let broken = response_from_chat_json(b"{", "model").expect_err("json");
         assert_eq!(broken.kind(), "protocol_violation");
+        assert_eq!(broken.code(), "invalid_http_json");
+        assert_eq!(
+            broken.to_string(),
+            "model backend violated the response protocol: Ollama HTTP response was not valid JSON"
+        );
         assert!(!broken.to_string().contains('{'));
     }
 
@@ -797,6 +815,7 @@ mod tests {
         let payload = chat_payload(&request, false).expect("payload");
         assert_eq!(payload["stream"], false);
         assert_eq!(payload["format"], "json");
+        assert!(payload["format"].is_string());
         let tools = payload["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");

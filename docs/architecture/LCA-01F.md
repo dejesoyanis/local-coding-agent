@@ -43,7 +43,7 @@ The chosen protocol is stored on the run and reused for every generation. A prot
 
 `lca agent run` uses the same selection, then still performs one generation. For `lca-30b-agent`, default `auto` is now JSON. Native single-turn calls pass `--protocol native`. The probe does not use the profile, so a probe of the same model can still report native when tools are confirmed.
 
-Loop prompt version is `lca-01f.1`. The eval prompt version stays `lca-01e-h1.1`.
+Loop prompt version is `lca-01f-h1.1`. The eval prompt version stays `lca-01e-h1.1`. The single-turn prompt is unchanged.
 
 ## State machine
 
@@ -98,11 +98,39 @@ Result objects are JSON values. File text is a string field inside that object. 
 
 Version 1 is `protocol_version` and `actions` only. `parse_action_document` still rejects every other version, so `lca agent run` and the LCA-01C tests keep that contract.
 
-`parse_agent_document` is the same decoder with version 2 enabled. Version 2 may include `final_answer`. The string is required when `actions` is empty and forbidden when `actions` is not empty. A version-1 document with actions is still a tool turn. A version-1 document with an empty `actions` array has no `final_answer`, so the loop treats it as a protocol error (`missing_final_answer`) and stops. It is not a successful empty turn, and it does not switch to native.
+`parse_agent_document` is the same decoder with version 2 enabled. Version 2 may include `final_answer`. The string is required when `actions` is empty and forbidden when `actions` is not empty. A blank or whitespace-only string is `empty_final_answer`. The decoder does not repair JSON, strip a markdown fence, or drop unknown fields. A version-1 document with actions is still a tool turn. A version-1 document with an empty `actions` array has no `final_answer`, so the loop treats it as a protocol error (`missing_final_answer`) and stops. It is not a successful empty turn, and it does not switch to native.
+
+The loop prompt states that contract without a contradictory “do not add fields” line. `protocol_version` is always 2. `actions` is always present. `final_answer` is absent when `actions` is not empty, and it is a non-empty string when `actions` is empty. The only allowed fields are those three. The model response is one JSON object, with no markdown fence and no text outside the object. The prompt includes one tool-call example and one final-answer example, and both parse with `parse_agent_document`. The examples are not introduced with a `Final answer:` label. That label was copied into a field name `final_answer:`, which the parser rejects as an unknown field.
 
 ```json
 {"protocol_version": 2, "actions": [], "final_answer": "..."}
 ```
+
+### JSON output request
+
+`json_mode_confirmed` is true only when `/api/show` lists `json` or `json_mode`. Requesting JSON output does not set the flag.
+
+`BoundedAgentController` sends `ResponseFormat::Json` on every JSON run, including when the capability is unconfirmed. `lca-ollama` maps that to the Ollama field `format` with the string `json`. That mode asks for syntactic JSON. The request does not include a JSON Schema. The controller still validates the document.
+
+`SingleTurnAgentController` is unchanged. It sends `ResponseFormat::Json` only when JSON mode is confirmed, and `ResponseFormat::Text` otherwise. It still accepts only protocol version 1.
+
+If Ollama rejects `format: "json"`, the adapter returns the HTTP failure. A 400 is `invalid_request` and the run stops as `model_error`. A 200 whose body is not JSON is `invalid_http_json` and the run stops as `protocol_error`. Neither path switches to native, and neither sends another generation.
+
+### Diagnostics
+
+A rejected assistant document records a code, the response length, the protocol version when that JSON number can be read, whether `actions` and `final_answer` are present, and the finish reason. The detail and the debug log do not include the assistant text or a file body.
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_json` | Assistant content is not one JSON value |
+| `invalid_http_json` | The Ollama HTTP body is not JSON. `RuntimeError::kind` stays `protocol_violation` |
+| `missing_final_answer` | Version 2 has an empty `actions` array and no `final_answer` |
+| `empty_final_answer` | `final_answer` is empty or only whitespace |
+| `missing_version`, `invalid_version`, `unsupported_version` | The protocol version is missing, not an integer, or not supported |
+| `markdown`, `unknown_field`, `not_an_object`, `invalid_action`, `final_answer_conflict`, and the other parser kinds | The document structure was rejected |
+| `truncated_response` | The finish reason is `length` and the assistant content is not valid JSON |
+
+A finish reason of `length` on a document that already parsed is not reported as truncation.
 
 ## Tool results
 

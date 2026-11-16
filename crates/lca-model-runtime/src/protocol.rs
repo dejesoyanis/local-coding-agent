@@ -25,8 +25,9 @@ pub enum SelectedProtocol {
     /// The JSON action document will be validated strictly.
     ///
     /// `json_mode_confirmed` is true only when the backend listed JSON mode.
-    /// A false value still allows the fallback, because the controller validates the
-    /// bytes. It does not mean the model will reliably emit JSON.
+    /// Requesting JSON output does not set it. A false value still allows this
+    /// protocol, because the controller validates the bytes. It does not mean the
+    /// model will reliably emit JSON.
     StructuredJson {
         /// Whether the backend listed JSON mode.
         json_mode_confirmed: bool,
