@@ -4,7 +4,7 @@ use crate::fs::limits::{FsLimits, MAX_DIRECTORY_SCAN};
 use crate::fs::read::{privacy_gate, read_gate};
 use crate::fs_error::{FsError, display_path};
 use crate::privacy::deny_overrides;
-use crate::sandbox::{WorkspaceSandbox, is_reparse, read_resolved_file};
+use crate::sandbox::{WorkspaceSandbox, read_resolved_file};
 
 const EXCLUDED_DIRECTORIES: &[&str] = &[".git", "target", "node_modules"];
 const MAX_LINE_CHARS: usize = 512;
@@ -102,69 +102,54 @@ fn visit(
             path: directory.to_owned(),
         });
     }
-    let mut names = Vec::new();
-    let mut seen = 0usize;
-    let reader = std::fs::read_dir(resolved.absolute()).map_err(|error| FsError::Io {
-        path: directory.to_owned(),
-        message: error.to_string(),
-    })?;
-    for entry in reader {
-        let entry = entry.map_err(|error| FsError::Io {
-            path: directory.to_owned(),
-            message: error.to_string(),
-        })?;
-        seen += 1;
-        if seen > MAX_DIRECTORY_SCAN {
+    let children = match sandbox.list_children(directory, MAX_DIRECTORY_SCAN) {
+        Ok(children) => children,
+        Err(FsError::LimitExceeded { .. }) => {
             state.truncated = true;
             return Ok(());
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            state.skipped += 1;
-            continue;
-        };
-        if name == "." || name == ".." || !safe_name(&name) {
-            continue;
-        }
-        let child = if directory == "." {
-            name.clone()
-        } else {
-            format!("{directory}/{name}")
-        };
-        if sandbox.privacy().blocks(&child) {
-            continue;
-        }
-        names.push(name);
+        Err(error) => return Err(error),
+    };
+    if children.len() > MAX_DIRECTORY_SCAN {
+        state.truncated = true;
+        return Ok(());
     }
-    names.sort();
-    for name in names {
+    let mut children = children;
+    children.sort_by(|left, right| left.name.cmp(&right.name));
+    for child in children {
         if state.truncated {
             break;
         }
-        let child = if directory == "." {
-            name.clone()
+        if child.name == "." || child.name == ".." || !safe_name(&child.name) {
+            continue;
+        }
+        let path = if directory == "." {
+            child.name.clone()
         } else {
-            format!("{directory}/{name}")
+            format!("{directory}/{}", child.name)
         };
-        let full = resolved.absolute().join(&name);
-        let meta = match std::fs::symlink_metadata(&full) {
-            Ok(meta) => meta,
-            Err(_) => {
-                state.skipped += 1;
-                continue;
-            }
-        };
-        if is_reparse(&meta) {
+        if sandbox.privacy().blocks(&path) {
             continue;
         }
-        if meta.is_dir() {
-            if is_excluded_name(&name) {
-                continue;
-            }
-            visit(sandbox, limits, &child, query, state)?;
+        if child.kind == "reparse" {
             continue;
         }
-        if meta.is_file() {
-            scan_file(sandbox, limits, &child, meta.len(), query, state)?;
+        if child.kind == "directory" {
+            if is_excluded_name(&child.name) {
+                continue;
+            }
+            visit(sandbox, limits, &path, query, state)?;
+            continue;
+        }
+        if child.kind == "file" {
+            scan_file(
+                sandbox,
+                limits,
+                &path,
+                child.size.unwrap_or(0),
+                query,
+                state,
+            )?;
         } else {
             state.skipped += 1;
         }
@@ -204,12 +189,16 @@ fn scan_file(
         state.skipped += 1;
         return Ok(());
     }
-    let bytes = match read_resolved_file(&resolved, limits.max_file_size_bytes()) {
+    let bytes = match read_resolved_file(sandbox, &resolved, limits.max_file_size_bytes()) {
         Ok(bytes) => bytes,
         Err(FsError::FileChanged { .. }) => {
             return Err(FsError::FileChanged {
                 path: path.to_owned(),
             });
+        }
+        Err(FsError::HardlinkDenied { .. } | FsError::ReparseDenied { .. }) => {
+            state.skipped += 1;
+            return Ok(());
         }
         Err(_) => {
             state.skipped += 1;

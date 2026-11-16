@@ -962,7 +962,7 @@ fn prepare_rejects_a_hardlink_and_does_not_change_either_name() {
 }
 
 #[test]
-fn a_hardlink_alias_of_a_protected_file_is_not_detected() {
+fn a_hardlink_alias_of_a_protected_file_is_refused() {
     let root = TempDir::new("privacy-hardlink");
     let secret = root.path().join(".env");
     let alias = root.path().join("notes.txt");
@@ -977,16 +977,31 @@ fn a_hardlink_alias_of_a_protected_file_is_not_detected() {
     .expect_err("name");
     assert_eq!(denied.kind(), "privacy_denied");
     assert!(!denied.to_string().contains("alias-visible"));
-    let read = run(
+    let alias_read = execute_validated(
+        &action("read_file", json!({"path": "notes.txt"})),
         &sandbox,
         &wide_limits(),
-        "read_file",
-        json!({"path": "notes.txt"}),
-    );
-    let FsOutcome::Read(read) = read else {
-        panic!("alias");
+    )
+    .expect_err("hardlink");
+    assert_eq!(alias_read.kind(), "hardlink_denied");
+    assert!(!alias_read.to_string().contains("alias-visible"));
+    let searched = execute_validated(
+        &action(
+            "search_files",
+            json!({"query": "alias-visible", "path": "."}),
+        ),
+        &sandbox,
+        &wide_limits(),
+    )
+    .expect("search");
+    let FsOutcome::Searched(searched) = searched else {
+        panic!("search");
     };
-    assert_eq!(read.content, "alias-visible\n");
+    assert!(
+        searched.matches.is_empty(),
+        "hardlink content must not be returned"
+    );
+    assert!(!format!("{searched:?}").contains("alias-visible"));
 }
 
 #[test]

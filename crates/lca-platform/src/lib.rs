@@ -72,6 +72,14 @@ pub enum PlatformError {
     Hardlink,
     /// The handle is not the object that was expected.
     Identity,
+    /// The path does not exist.
+    NotFound,
+    /// The object is not a regular file.
+    NotFile,
+    /// The directory entry was published and the read-back did not match.
+    Verify,
+    /// A test fault point fired. Production calls do not construct this.
+    Injected,
     /// Another handle already has the file open in a conflicting way.
     Sharing,
     /// The directory ACL could not be restricted to the current user.
@@ -91,6 +99,10 @@ impl std::fmt::Display for PlatformError {
             Self::Reparse => formatter.write_str("reparse point"),
             Self::Hardlink => formatter.write_str("hard link"),
             Self::Identity => formatter.write_str("file identity changed"),
+            Self::NotFound => formatter.write_str("path was not found"),
+            Self::NotFile => formatter.write_str("path is not a regular file"),
+            Self::Verify => formatter.write_str("published bytes did not match"),
+            Self::Injected => formatter.write_str("injected fault"),
             Self::Sharing => formatter.write_str("file is busy"),
             Self::Acl => formatter.write_str("directory ACL is not restricted"),
             Self::Protect => formatter.write_str("local protection failed"),
@@ -123,12 +135,118 @@ impl OpenedTarget {
         self.inner.read(max)
     }
 
-    /// Replaces the directory entry with `bytes` and returns the bytes read back.
+    /// Publishes `bytes` through the open handle and returns the bytes read back.
     ///
-    /// A mismatch after the directory entry is replaced is returned as data. This
-    /// function does not restore the previous file.
-    pub fn replace_with(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PlatformError> {
-        self.inner.replace_with(bytes)
+    /// The directory entry is not renamed. `root` and `components` are checked against
+    /// the handle before and after the write. A mismatch after the write is
+    /// [`PublishFailure`] with `published == true`. This function does not restore the
+    /// previous bytes.
+    pub fn replace_with(
+        &mut self,
+        bytes: &[u8],
+        root: &Path,
+        components: &[String],
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), PlatformError>,
+    ) -> Result<Vec<u8>, PublishFailure> {
+        self.inner.replace_with(bytes, root, components, hook)
+    }
+}
+
+/// Points where a publish can be observed or faulted.
+///
+/// `BeforeRename` is the last point before the verified handle changes.
+/// `AfterRename` is the first point after those bytes have been flushed.
+/// The names match the fault model. The implementation does not rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishPhase {
+    /// The temporary file exists and has not been written.
+    AfterTempCreate,
+    /// The temporary file contains the full byte image.
+    AfterWrite,
+    /// The target handle is about to be overwritten.
+    BeforeRename,
+    /// The target handle has the new bytes and they have been flushed.
+    AfterRename,
+    /// The handle is about to be read back.
+    BeforeReadback,
+    /// The read-back is treated as failed even if the handle bytes match.
+    DuringReadback,
+}
+
+/// A publish that did not finish cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishFailure {
+    error: PlatformError,
+    published: bool,
+}
+
+impl PublishFailure {
+    /// Why the publish stopped.
+    #[must_use]
+    pub fn error(&self) -> &PlatformError {
+        &self.error
+    }
+
+    /// Whether the target handle may already contain new bytes.
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
+    }
+}
+
+/// Bytes read from the handle a path walk opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadCapture {
+    info: ObjectInfo,
+    bytes: Vec<u8>,
+}
+
+impl ReadCapture {
+    /// Identity of the handle that was read.
+    #[must_use]
+    pub const fn info(&self) -> ObjectInfo {
+        self.info
+    }
+
+    /// File bytes. Empty when the file is empty.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// One name from a handle-based directory query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    name: String,
+    end_of_file: u64,
+    is_directory: bool,
+    is_reparse: bool,
+}
+
+impl DirEntry {
+    /// File name. `.` and `..` are omitted.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// End of file for a non-directory. Zero for directories.
+    #[must_use]
+    pub const fn end_of_file(&self) -> u64 {
+        self.end_of_file
+    }
+
+    /// The entry is a directory and not a reparse point.
+    #[must_use]
+    pub const fn is_directory(&self) -> bool {
+        self.is_directory && !self.is_reparse
+    }
+
+    /// The entry is a reparse point. It was not opened.
+    #[must_use]
+    pub const fn is_reparse(&self) -> bool {
+        self.is_reparse
     }
 }
 
@@ -140,6 +258,43 @@ pub fn inspect(path: &Path) -> Result<ObjectInfo, PlatformError> {
 /// Opens `components` underneath `root` by relative handle opens.
 pub fn open_tree(root: &Path, components: &[String]) -> Result<OpenedTarget, PlatformError> {
     sys::open_tree(root, components).map(|inner| OpenedTarget { inner })
+}
+
+/// Identity of one relative path, taken from the handle the walk opened.
+pub fn stat_tree(root: &Path, components: &[String]) -> Result<ObjectInfo, PlatformError> {
+    sys::stat_tree(root, components)
+}
+
+/// Reads a regular file through the handle the walk opened.
+///
+/// A reparse point or a link count other than 1 is refused before the bytes are returned.
+pub fn read_tree(
+    root: &Path,
+    components: &[String],
+    max: u64,
+) -> Result<ReadCapture, PlatformError> {
+    sys::read_tree(root, components, max).map(|(info, bytes)| ReadCapture { info, bytes })
+}
+
+/// Lists one directory through the handle the walk opened.
+///
+/// Child reparse points are reported and not opened. More than `max_entries` names is an error.
+pub fn list_tree(
+    root: &Path,
+    components: &[String],
+    max_entries: usize,
+) -> Result<Vec<DirEntry>, PlatformError> {
+    sys::list_tree(root, components, max_entries).map(|entries| {
+        entries
+            .into_iter()
+            .map(|(name, end_of_file, is_directory, is_reparse)| DirEntry {
+                name,
+                end_of_file,
+                is_directory,
+                is_reparse,
+            })
+            .collect()
+    })
 }
 
 /// Protects `plaintext` so only the current Windows user can unprotect it.
@@ -320,20 +475,142 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn replace_with_exchanges_bytes_and_keeps_a_readback() {
+    fn replace_with_keeps_the_file_id_and_reads_back() {
         let root = temp_dir("replace");
         std::fs::write(root.join("notes.txt"), b"alpha\n").expect("seed");
         let before = inspect(&root.join("notes.txt")).expect("before");
-        let mut opened = open_tree(&root, &[String::from("notes.txt")]).expect("open");
+        let components = vec![String::from("notes.txt")];
+        let mut opened = open_tree(&root, &components).expect("open");
         assert_eq!(opened.info().file_id(), before.file_id());
-        let readback = opened.replace_with(b"beta\n").expect("replace");
+        let readback = opened
+            .replace_with(b"beta\n", &root, &components, &mut |_| Ok(()))
+            .expect("replace");
         assert_eq!(readback, b"beta\n");
         assert_eq!(
             std::fs::read(root.join("notes.txt")).expect("disk"),
             b"beta\n"
         );
         let after = inspect(&root.join("notes.txt")).expect("after");
-        assert_ne!(after.file_id(), before.file_id());
+        assert_eq!(after.file_id(), before.file_id());
+        let captured = read_tree(&root, &components, 64).expect("read");
+        assert_eq!(captured.bytes(), b"beta\n");
+        assert_eq!(captured.info().file_id(), before.file_id());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_tree_refuses_a_hardlink_without_returning_bytes() {
+        let root = temp_dir("read-link");
+        std::fs::write(root.join("secret.txt"), b"SENTINEL\n").expect("secret");
+        std::fs::hard_link(root.join("secret.txt"), root.join("alias.txt")).expect("link");
+        let error = read_tree(&root, &[String::from("alias.txt")], 64).expect_err("hardlink");
+        assert!(matches!(error, PlatformError::Hardlink), "{error:?}");
+        assert!(!error.to_string().contains("SENTINEL"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_tree_reports_a_junction_and_does_not_open_it() {
+        let root = temp_dir("list-junction");
+        let outside = temp_dir("list-junction-out");
+        std::fs::write(outside.join("secret.txt"), b"SENTINEL\n").expect("secret");
+        let link = root.join("link");
+        let output = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &outside.to_string_lossy(),
+            ])
+            .output()
+            .expect("mklink");
+        assert!(output.status.success(), "{output:?}");
+        let entries = list_tree(&root, &[], 100).expect("list");
+        let junction = entries
+            .iter()
+            .find(|entry| entry.name() == "link")
+            .expect("link");
+        assert!(junction.is_reparse());
+        let nested = read_tree(
+            &root,
+            &[String::from("link"), String::from("secret.txt")],
+            64,
+        );
+        assert!(matches!(nested, Err(PlatformError::Reparse)), "{nested:?}");
+        assert!(!format!("{nested:?}").contains("SENTINEL"));
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reserved_names_and_streams_are_rejected() {
+        let root = temp_dir("reserved");
+        std::fs::write(root.join("notes.txt"), b"alpha\n").expect("seed");
+        for name in ["NUL", "CON", "COM1", "notes.txt:stream", ".."] {
+            let opened = open_tree(&root, &[String::from(name)]);
+            assert!(opened.is_err(), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_moved_parent_is_not_treated_as_the_checked_target() {
+        let root = temp_dir("parent-swap");
+        std::fs::create_dir(root.join("sub")).expect("sub");
+        std::fs::write(root.join("sub").join("notes.txt"), b"alpha\n").expect("seed");
+        let components = vec![String::from("sub"), String::from("notes.txt")];
+        let mut opened = open_tree(&root, &components).expect("open");
+        let renamed = std::fs::rename(root.join("sub"), root.join("sub-old"));
+        if renamed.is_ok() {
+            std::fs::create_dir(root.join("sub")).expect("new sub");
+            std::fs::write(root.join("sub").join("notes.txt"), b"attacker\n").expect("attacker");
+            let error = opened
+                .replace_with(b"beta\n", &root, &components, &mut |_| Ok(()))
+                .expect_err("must not publish onto the swapped name");
+            assert!(!error.published(), "{error:?}");
+            assert_eq!(
+                std::fs::read(root.join("sub").join("notes.txt")).expect("attacker path"),
+                b"attacker\n"
+            );
+            assert_eq!(
+                std::fs::read(root.join("sub-old").join("notes.txt")).expect("original"),
+                b"alpha\n"
+            );
+        } else {
+            let readback = opened
+                .replace_with(b"beta\n", &root, &components, &mut |_| Ok(()))
+                .expect("original directory stayed in place");
+            assert_eq!(readback, b"beta\n");
+            assert_eq!(
+                std::fs::read(root.join("sub").join("notes.txt")).expect("same object"),
+                b"beta\n"
+            );
+        }
+        drop(opened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_target_cannot_be_renamed_away() {
+        let root = temp_dir("held");
+        std::fs::write(root.join("notes.txt"), b"alpha\n").expect("seed");
+        let components = vec![String::from("notes.txt")];
+        let opened = open_tree(&root, &components).expect("open");
+        let moved = root.join("moved.txt");
+        let rename = std::fs::rename(root.join("notes.txt"), &moved);
+        assert!(rename.is_err(), "{rename:?}");
+        assert_eq!(
+            std::fs::read(root.join("notes.txt")).expect("still there"),
+            b"alpha\n"
+        );
+        drop(opened);
         let _ = std::fs::remove_dir_all(root);
     }
 

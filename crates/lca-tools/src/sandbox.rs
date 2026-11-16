@@ -5,9 +5,9 @@
 //! checked with `symlink_metadata` before the walk continues. Symlinks, junctions, and
 //! other reparse points are rejected rather than followed.
 //!
-//! On Windows, file reads open with `FILE_FLAG_OPEN_REPARSE_POINT`, so the final
-//! component is not followed. Intermediate components are still subject to a
-//! check-then-open race. That race is not claimed to be closed. See the LCA-01D notes.
+//! On Windows, file bytes and directory listings come from `lca-platform` handle walks.
+//! A path string is not opened again after the walk. Other platforms keep the
+//! nofollow read and fail closed for verified apply.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -205,13 +205,15 @@ impl WorkspaceSandbox {
         Ok(resolved)
     }
 
-    /// Reads one resolved file without following a final reparse point.
+    /// Reads one resolved file without following a reparse point.
     ///
     /// The read fails when the file is larger than `max_bytes`. It does not return a prefix.
-    /// A protected path is rejected before the file is opened.
+    /// A protected path is rejected before the file is opened. On Windows the bytes come
+    /// from the handle opened by a relative walk. A second hard link is refused before
+    /// those bytes are returned.
     pub fn read_bytes(&self, relative: &str, max_bytes: u64) -> Result<Vec<u8>, FsError> {
         let resolved = self.resolve_visible(relative)?;
-        read_resolved_file(&resolved, max_bytes)
+        read_resolved_file(self, &resolved, max_bytes)
     }
 
     /// Resolves a relative path. Absolute paths, `..`, and reparse points are rejected.
@@ -479,6 +481,7 @@ impl WorkspaceSandbox {
 }
 
 /// Opens `path` for reading. On Windows the final component is not followed.
+#[cfg(not(windows))]
 pub(crate) fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -503,11 +506,188 @@ pub(crate) fn create_new_nofollow(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// Reads a resolved file without following a final reparse point.
+/// One directory entry from a handle walk or, off Windows, from `read_dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListedChild {
+    /// File name.
+    pub name: String,
+    /// `file`, `directory`, or `reparse`.
+    pub kind: String,
+    /// Length of a regular file.
+    pub size: Option<u64>,
+}
+
+impl WorkspaceSandbox {
+    /// Lists `relative` without following a child reparse point.
+    pub(crate) fn list_children(
+        &self,
+        relative: &str,
+        scan_limit: usize,
+    ) -> Result<Vec<ListedChild>, FsError> {
+        #[cfg(windows)]
+        {
+            let components = if relative == "." {
+                Vec::new()
+            } else {
+                relative_components(relative)?
+            };
+            match lca_platform::list_tree(self.root(), &components, scan_limit) {
+                Ok(entries) => Ok(entries
+                    .into_iter()
+                    .map(|entry| {
+                        let kind = if entry.is_reparse() {
+                            "reparse"
+                        } else if entry.is_directory() {
+                            "directory"
+                        } else {
+                            "file"
+                        };
+                        ListedChild {
+                            name: entry.name().to_owned(),
+                            kind: kind.to_owned(),
+                            size: if kind == "file" {
+                                Some(entry.end_of_file())
+                            } else {
+                                None
+                            },
+                        }
+                    })
+                    .collect()),
+                Err(error) => Err(map_platform(relative, error, 0)),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = scan_limit;
+            list_children_nofollow(self, relative)
+        }
+    }
+}
+
+/// Reads a resolved file.
+///
+/// Windows reads through the relative handle walk and does not fall back to the path.
+/// A link count other than 1 is refused before the bytes are returned.
 pub(crate) fn read_resolved_file(
+    sandbox: &WorkspaceSandbox,
     resolved: &ResolvedPath,
     max_bytes: u64,
 ) -> Result<Vec<u8>, FsError> {
+    #[cfg(windows)]
+    {
+        let components = relative_components(resolved.relative())?;
+        match lca_platform::read_tree(sandbox.root(), &components, max_bytes) {
+            Ok(capture) => Ok(capture.bytes().to_vec()),
+            Err(error) => Err(map_platform(resolved.relative(), error, max_bytes)),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = sandbox;
+        read_nofollow(resolved, max_bytes)
+    }
+}
+
+#[cfg(windows)]
+fn relative_components(relative: &str) -> Result<Vec<String>, FsError> {
+    if relative.is_empty() || relative == "." {
+        return Err(FsError::NotAFile {
+            path: relative.to_owned(),
+        });
+    }
+    Ok(relative
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect())
+}
+
+#[cfg(windows)]
+fn map_platform(path: &str, error: lca_platform::PlatformError, max_bytes: u64) -> FsError {
+    match error {
+        lca_platform::PlatformError::Unsupported => FsError::UnsupportedPlatform,
+        lca_platform::PlatformError::Reparse => FsError::ReparseDenied {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Hardlink => FsError::HardlinkDenied {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::NotFound => FsError::NotFound {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::NotFile => FsError::NotAFile {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Identity => FsError::FileChanged {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Io(message) if message.contains("exceeds the read cap") => {
+            FsError::TooLarge {
+                path: path.to_owned(),
+                limit: max_bytes,
+            }
+        }
+        lca_platform::PlatformError::Io(message) if message.contains("too large to list") => {
+            FsError::LimitExceeded { message }
+        }
+        lca_platform::PlatformError::Io(message) => FsError::Io {
+            path: path.to_owned(),
+            message,
+        },
+        other => FsError::Io {
+            path: path.to_owned(),
+            message: other.to_string(),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn list_children_nofollow(
+    sandbox: &WorkspaceSandbox,
+    relative: &str,
+) -> Result<Vec<ListedChild>, FsError> {
+    let resolved = sandbox.resolve_visible(relative)?;
+    let reader = std::fs::read_dir(resolved.absolute()).map_err(|error| FsError::Io {
+        path: relative.to_owned(),
+        message: error.to_string(),
+    })?;
+    let mut children = Vec::new();
+    for entry in reader {
+        let entry = entry.map_err(|error| FsError::Io {
+            path: relative.to_owned(),
+            message: error.to_string(),
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let meta = match std::fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        let kind = if is_reparse(&meta) {
+            "reparse"
+        } else if meta.is_dir() {
+            "directory"
+        } else if meta.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        children.push(ListedChild {
+            name,
+            kind: kind.to_owned(),
+            size: if kind == "file" {
+                Some(meta.len())
+            } else {
+                None
+            },
+        });
+    }
+    Ok(children)
+}
+
+#[cfg(not(windows))]
+fn read_nofollow(resolved: &ResolvedPath, max_bytes: u64) -> Result<Vec<u8>, FsError> {
     if !resolved.is_file() {
         return Err(FsError::NotAFile {
             path: resolved.relative().to_owned(),
@@ -537,6 +717,15 @@ pub(crate) fn read_resolved_file(
         return Err(FsError::NotAFile {
             path: raw.to_owned(),
         });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Err(FsError::HardlinkDenied {
+                path: raw.to_owned(),
+            });
+        }
     }
     if meta.len() > max_bytes {
         return Err(FsError::TooLarge {

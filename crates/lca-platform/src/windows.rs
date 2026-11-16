@@ -1,6 +1,13 @@
 //! Windows file identity, relative opens, DPAPI, and owner-only ACLs.
 //!
 //! `unsafe` stays in this module. The exported functions do not take raw pointers.
+//!
+//! Every `unsafe` call uses a `windows-sys` 0.59 prototype. Pointers are either null,
+//! a handle this module opened and still owns, or a buffer whose length is the value
+//! passed to the API. Returned buffers are read only up to the size the API reports.
+//! `NtCreateFile` object attributes point at the parent handle and a name that lives
+//! for the call. Directory listings copy names out of the query buffer before reuse.
+//! None of these calls accept a path string as a substitute for the handle they query.
 
 #![allow(unsafe_code)]
 
@@ -13,7 +20,7 @@ use std::ptr;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FileRenameInformation, NtCreateFile, NtSetInformationFile,
+    FileBothDirectoryInformation, NtCreateFile, NtQueryDirectoryFile,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_SHARING_VIOLATION, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
@@ -25,17 +32,18 @@ use windows_sys::Win32::Security::{
     SID_IDENTIFIER_AUTHORITY, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_ID_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileIdInfo, FileStandardInfo, FlushFileBuffers, GetFileInformationByHandleEx,
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_EXISTING, ReadFile,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_READ, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdInfo, FileStandardInfo, FlushFileBuffers,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_EXISTING, ReadFile, SetEndOfFile,
     SetFileInformationByHandle, SetFilePointerEx, WriteFile,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use crate::{ObjectInfo, PlatformError};
+use crate::{ObjectInfo, PlatformError, PublishFailure, PublishPhase};
 
 const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const FILE_LIST_DIRECTORY: u32 = 0x0001;
@@ -43,7 +51,6 @@ const FILE_ADD_FILE: u32 = 0x0002;
 const FILE_DELETE_CHILD: u32 = 0x0040;
 const FILE_TRAVERSE: u32 = 0x0020;
 const FILE_WRITE_DATA: u32 = 0x0002;
-const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
 const DELETE: u32 = 0x0001_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
@@ -55,7 +62,6 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_OPEN_REPARSE_POINT_NT: u32 = 0x0020_0000;
 const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
-const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
 const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
 const ERROR_SUCCESS: u32 = 0;
 const SE_FILE_OBJECT: i32 = 1;
@@ -74,7 +80,6 @@ pub(crate) struct OpenedTarget {
     parent: OwnedHandle,
     file: OwnedHandle,
     info: ObjectInfo,
-    file_name: Vec<u16>,
 }
 
 impl OpenedTarget {
@@ -90,55 +95,108 @@ impl OpenedTarget {
         read_handle(self.file.raw(), max)
     }
 
-    pub(crate) fn replace_with(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PlatformError> {
-        let current = query_handle(self.file.raw())?;
-        if current.file_id != self.info.file_id || current.volume_serial != self.info.volume_serial
-        {
-            return Err(PlatformError::Identity);
+    pub(crate) fn replace_with(
+        &mut self,
+        bytes: &[u8],
+        root: &Path,
+        components: &[String],
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), PlatformError>,
+    ) -> Result<Vec<u8>, PublishFailure> {
+        let clean = |error| PublishFailure {
+            error,
+            published: false,
+        };
+        let published = |error| PublishFailure {
+            error,
+            published: true,
+        };
+        let current = match query_handle(self.file.raw()) {
+            Ok(info) => info,
+            Err(error) => return Err(clean(error)),
+        };
+        if let Err(error) = require_same_file(&current, &self.info) {
+            return Err(clean(error));
         }
-        if current.is_reparse {
-            return Err(PlatformError::Reparse);
+        if let Err(error) = confirm_bound(self.file.raw(), root, components) {
+            return Err(clean(error));
         }
-        if current.link_count != 1 {
-            return Err(PlatformError::Hardlink);
-        }
-        let temp_name = temp_component();
-        let temp = create_child(
-            self.parent.raw(),
-            &temp_name,
-            DELETE | FILE_GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        )
-        .map_err(label("temp create"))?;
-        let write_result = write_handle(temp.raw(), bytes).and_then(|()| flush_handle(temp.raw()));
-        if let Err(error) = write_result {
+        let temp = match create_temp(self.parent.raw()) {
+            Ok(temp) => temp,
+            Err(error) => return Err(clean(error)),
+        };
+        if let Err(error) = hook(PublishPhase::AfterTempCreate) {
             dispose_handle(temp.raw());
-            return Err(error);
+            return Err(clean(error));
         }
-        let again = query_handle(self.file.raw())?;
-        if again.file_id != self.info.file_id || again.link_count != 1 || again.is_reparse {
-            dispose_handle(temp.raw());
-            return Err(if again.link_count != 1 {
-                PlatformError::Hardlink
-            } else if again.is_reparse {
-                PlatformError::Reparse
-            } else {
-                PlatformError::Identity
+        let staged = write_handle(temp.raw(), bytes)
+            .and_then(|()| flush_handle(temp.raw()))
+            .and_then(|()| read_handle(temp.raw(), (bytes.len() as u64).saturating_add(1)))
+            .and_then(|readback| {
+                if readback == bytes {
+                    Ok(())
+                } else {
+                    Err(PlatformError::Verify)
+                }
             });
-        }
-        let old = std::mem::replace(&mut self.file, OwnedHandle(ptr::null_mut()));
-        drop(old);
-        let renamed =
-            rename_over(temp.raw(), self.parent.raw(), &self.file_name).map_err(label("rename"));
-        if let Err(error) = renamed {
+        if let Err(error) = staged {
             dispose_handle(temp.raw());
-            return Err(error);
+            return Err(clean(error));
         }
-        let readback = read_handle(temp.raw(), (bytes.len() as u64).saturating_add(1));
-        drop(temp);
-        readback
+        if let Err(error) = hook(PublishPhase::AfterWrite) {
+            dispose_handle(temp.raw());
+            return Err(clean(error));
+        }
+        let again = match query_handle(self.file.raw()) {
+            Ok(info) => info,
+            Err(error) => {
+                dispose_handle(temp.raw());
+                return Err(clean(error));
+            }
+        };
+        if let Err(error) = require_same_file(&again, &self.info) {
+            dispose_handle(temp.raw());
+            return Err(clean(error));
+        }
+        if let Err(error) = confirm_bound(self.file.raw(), root, components) {
+            dispose_handle(temp.raw());
+            return Err(clean(error));
+        }
+        if let Err(error) = hook(PublishPhase::BeforeRename) {
+            dispose_handle(temp.raw());
+            return Err(clean(error));
+        }
+        dispose_handle(temp.raw());
+        if let Err(error) = publish_handle(self.file.raw(), bytes) {
+            return Err(published(error));
+        }
+        if let Err(error) = hook(PublishPhase::AfterRename) {
+            return Err(published(error));
+        }
+        if let Err(error) = hook(PublishPhase::BeforeReadback) {
+            return Err(published(error));
+        }
+        if let Err(error) = hook(PublishPhase::DuringReadback) {
+            return Err(published(error));
+        }
+        let readback = match read_handle(self.file.raw(), (bytes.len() as u64).saturating_add(1)) {
+            Ok(readback) => readback,
+            Err(error) => return Err(published(error)),
+        };
+        if readback != bytes {
+            return Err(published(PlatformError::Verify));
+        }
+        let after = match query_handle(self.file.raw()) {
+            Ok(info) => info,
+            Err(error) => return Err(published(error)),
+        };
+        if let Err(error) = require_same_file(&after, &self.info) {
+            return Err(published(error));
+        }
+        if let Err(error) = confirm_bound(self.file.raw(), root, components) {
+            return Err(published(error));
+        }
+        self.info = after;
+        Ok(readback)
     }
 }
 
@@ -150,105 +208,107 @@ pub(crate) fn inspect(path: &Path) -> Result<ObjectInfo, PlatformError> {
 }
 
 pub(crate) fn open_tree(root: &Path, components: &[String]) -> Result<OpenedTarget, PlatformError> {
-    if components.is_empty() || components.iter().any(|part| !valid_component(part)) {
+    open_leaf(
+        root,
+        components,
+        FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ,
+        false,
+    )
+}
+
+pub(crate) fn stat_tree(root: &Path, components: &[String]) -> Result<ObjectInfo, PlatformError> {
+    let opened = open_leaf(
+        root,
+        components,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        true,
+    )?;
+    Ok(opened.info)
+}
+
+pub(crate) fn read_tree(
+    root: &Path,
+    components: &[String],
+    max: u64,
+) -> Result<(ObjectInfo, Vec<u8>), PlatformError> {
+    let opened = open_leaf(
+        root,
+        components,
+        FILE_GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        false,
+    )?;
+    if opened.info.is_reparse {
+        return Err(PlatformError::Reparse);
+    }
+    if opened.info.is_directory {
+        return Err(PlatformError::NotFile);
+    }
+    if opened.info.link_count != 1 {
+        return Err(PlatformError::Hardlink);
+    }
+    if opened.info.file_id == [0; 16] {
+        return Err(PlatformError::Identity);
+    }
+    if opened.info.end_of_file > max {
+        return Err(PlatformError::Io("file exceeds the read cap".to_owned()));
+    }
+    let bytes = read_handle(opened.file.raw(), max)?;
+    let after = query_handle(opened.file.raw())?;
+    if after.file_id != opened.info.file_id
+        || after.volume_serial != opened.info.volume_serial
+        || after.link_count != 1
+        || after.is_reparse
+        || after.end_of_file != opened.info.end_of_file
+    {
+        return Err(PlatformError::Identity);
+    }
+    Ok((opened.info, bytes))
+}
+
+pub(crate) fn list_tree(
+    root: &Path,
+    components: &[String],
+    max_entries: usize,
+) -> Result<Vec<(String, u64, bool, bool)>, PlatformError> {
+    if components.iter().any(|part| !valid_component(part)) {
         return Err(PlatformError::Io(
             "path component is not a single name".to_owned(),
         ));
     }
-    let root_handle = open_with(
-        root,
-        FILE_LIST_DIRECTORY
-            | FILE_ADD_FILE
-            | FILE_DELETE_CHILD
-            | FILE_TRAVERSE
-            | FILE_READ_ATTRIBUTES
-            | SYNCHRONIZE,
-    )?;
-    let root_info = query_handle(root_handle.raw())?;
-    if root_info.is_reparse {
-        return Err(PlatformError::Reparse);
-    }
-    if !root_info.is_directory {
-        return Err(PlatformError::Io(
-            "workspace root is not a directory".to_owned(),
-        ));
-    }
-    let mut parent = root_handle;
-    let last = components.len() - 1;
-    for (index, component) in components.iter().enumerate() {
-        let wide = wide_component(component)?;
-        if index != last {
-            let child = create_child(
-                parent.raw(),
-                &wide,
-                FILE_LIST_DIRECTORY
-                    | FILE_ADD_FILE
-                    | FILE_DELETE_CHILD
-                    | FILE_READ_ATTRIBUTES
-                    | SYNCHRONIZE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_OPEN,
-                FILE_DIRECTORY_FILE
-                    | FILE_SYNCHRONOUS_IO_NONALERT
-                    | FILE_OPEN_REPARSE_POINT_NT
-                    | FILE_OPEN_FOR_BACKUP_INTENT,
-            )?;
-            let info = query_handle(child.raw())?;
-            if info.is_reparse {
-                return Err(PlatformError::Reparse);
-            }
-            if !info.is_directory {
-                return Err(PlatformError::Io(
-                    "path component is not a directory".to_owned(),
-                ));
-            }
-            parent = child;
-        } else {
-            let probe = create_child(
-                parent.raw(),
-                &wide,
-                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_OPEN,
-                FILE_SYNCHRONOUS_IO_NONALERT
-                    | FILE_OPEN_REPARSE_POINT_NT
-                    | FILE_OPEN_FOR_BACKUP_INTENT,
-            )?;
-            let probed = query_handle(probe.raw())?;
-            drop(probe);
-            if probed.is_reparse {
-                return Err(PlatformError::Reparse);
-            }
-            if probed.is_directory {
-                return Err(PlatformError::Io("patch target is a directory".to_owned()));
-            }
-            let file = create_child(
-                parent.raw(),
-                &wide,
-                FILE_GENERIC_READ | SYNCHRONIZE,
-                FILE_SHARE_READ | FILE_SHARE_DELETE,
-                FILE_OPEN,
-                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT_NT,
-            )?;
-            let info = query_handle(file.raw())?;
-            if info.is_reparse {
-                return Err(PlatformError::Reparse);
-            }
-            if info.file_id != probed.file_id || info.volume_serial != probed.volume_serial {
-                return Err(PlatformError::Identity);
-            }
-            if info.file_id == [0; 16] {
-                return Err(PlatformError::Identity);
-            }
-            return Ok(OpenedTarget {
-                parent,
-                file,
-                info,
-                file_name: wide,
-            });
+    let directory = if components.is_empty() {
+        let handle = open_root(root)?;
+        let info = query_handle(handle.raw())?;
+        if info.is_reparse {
+            return Err(PlatformError::Reparse);
         }
-    }
-    Err(PlatformError::Io("path has no file name".to_owned()))
+        if !info.is_directory {
+            return Err(PlatformError::Io(
+                "workspace root is not a directory".to_owned(),
+            ));
+        }
+        handle
+    } else {
+        let opened = open_leaf(
+            root,
+            components,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            true,
+        )?;
+        if opened.info.is_reparse {
+            return Err(PlatformError::Reparse);
+        }
+        if !opened.info.is_directory {
+            return Err(PlatformError::Io(
+                "path component is not a directory".to_owned(),
+            ));
+        }
+        opened.file
+    };
+    list_handle(directory.raw(), max_entries)
 }
 
 pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
@@ -469,17 +529,368 @@ fn create_child(
         )
     };
     if status < 0 || handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        if status == STATUS_SHARING_VIOLATION {
-            return Err(PlatformError::Sharing);
-        }
-        return Err(PlatformError::Io(format!(
-            "relative open failed ({status:#x})"
-        )));
+        return Err(map_nt(status));
     }
     Ok(OwnedHandle(handle))
 }
 
-const STATUS_SHARING_VIOLATION: i32 = -1_073_741_757;
+fn map_nt(status: i32) -> PlatformError {
+    if status == STATUS_SHARING_VIOLATION {
+        PlatformError::Sharing
+    } else if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+        PlatformError::NotFound
+    } else if status == STATUS_FILE_IS_A_DIRECTORY || status == STATUS_NOT_A_DIRECTORY {
+        PlatformError::NotFile
+    } else {
+        PlatformError::Io(format!("relative open failed ({status:#x})"))
+    }
+}
+
+fn open_leaf(
+    root: &Path,
+    components: &[String],
+    access: u32,
+    share: u32,
+    allow_directory: bool,
+) -> Result<OpenedTarget, PlatformError> {
+    if components.is_empty() || components.iter().any(|part| !valid_component(part)) {
+        return Err(PlatformError::Io(
+            "path component is not a single name".to_owned(),
+        ));
+    }
+    let mut parent = open_root(root)?;
+    let root_info = query_handle(parent.raw())?;
+    if root_info.is_reparse {
+        return Err(PlatformError::Reparse);
+    }
+    if !root_info.is_directory {
+        return Err(PlatformError::Io(
+            "workspace root is not a directory".to_owned(),
+        ));
+    }
+    let last = components.len() - 1;
+    for (index, component) in components.iter().enumerate() {
+        let wide = wide_component(component)?;
+        if index != last {
+            parent = open_directory(parent, &wide)?;
+        } else {
+            let file = create_child(
+                parent.raw(),
+                &wide,
+                access,
+                share,
+                FILE_OPEN,
+                FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_REPARSE_POINT_NT
+                    | FILE_OPEN_FOR_BACKUP_INTENT,
+            )?;
+            let info = query_handle(file.raw())?;
+            if info.is_reparse {
+                return Err(PlatformError::Reparse);
+            }
+            if info.file_id == [0; 16] {
+                return Err(PlatformError::Identity);
+            }
+            if !allow_directory && info.is_directory {
+                return Err(PlatformError::NotFile);
+            }
+            return Ok(OpenedTarget { parent, file, info });
+        }
+    }
+    Err(PlatformError::Io("path has no file name".to_owned()))
+}
+
+fn open_root(root: &Path) -> Result<OwnedHandle, PlatformError> {
+    open_with(
+        root,
+        FILE_LIST_DIRECTORY
+            | FILE_ADD_FILE
+            | FILE_DELETE_CHILD
+            | FILE_TRAVERSE
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE,
+    )
+}
+
+fn open_directory(parent: OwnedHandle, name: &[u16]) -> Result<OwnedHandle, PlatformError> {
+    let child = create_child(
+        parent.raw(),
+        name,
+        FILE_LIST_DIRECTORY
+            | FILE_ADD_FILE
+            | FILE_DELETE_CHILD
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | FILE_OPEN_REPARSE_POINT_NT
+            | FILE_OPEN_FOR_BACKUP_INTENT,
+    )?;
+    let info = query_handle(child.raw())?;
+    if info.is_reparse {
+        return Err(PlatformError::Reparse);
+    }
+    if !info.is_directory {
+        return Err(PlatformError::Io(
+            "path component is not a directory".to_owned(),
+        ));
+    }
+    Ok(child)
+}
+
+fn require_same_file(current: &ObjectInfo, expected: &ObjectInfo) -> Result<(), PlatformError> {
+    if current.file_id != expected.file_id
+        || current.volume_serial != expected.volume_serial
+        || current.file_id == [0; 16]
+    {
+        return Err(PlatformError::Identity);
+    }
+    if current.is_reparse {
+        return Err(PlatformError::Reparse);
+    }
+    if current.link_count != 1 {
+        return Err(PlatformError::Hardlink);
+    }
+    if current.is_directory {
+        return Err(PlatformError::NotFile);
+    }
+    Ok(())
+}
+
+fn confirm_bound(handle: HANDLE, root: &Path, components: &[String]) -> Result<(), PlatformError> {
+    let actual = final_path(handle)?;
+    let root_handle = open_root(root)?;
+    let root_info = query_handle(root_handle.raw())?;
+    if root_info.is_reparse || !root_info.is_directory {
+        return Err(if root_info.is_reparse {
+            PlatformError::Reparse
+        } else {
+            PlatformError::Io("workspace root is not a directory".to_owned())
+        });
+    }
+    let mut expected = final_path(root_handle.raw())?;
+    for component in components {
+        if !expected.ends_with('\\') {
+            expected.push('\\');
+        }
+        expected.push_str(component);
+    }
+    if normalize_dos(&actual).eq_ignore_ascii_case(&normalize_dos(&expected)) {
+        Ok(())
+    } else {
+        Err(PlatformError::Identity)
+    }
+}
+
+fn normalize_dos(path: &str) -> String {
+    let stripped = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        path.to_owned()
+    };
+    stripped.trim_end_matches('\\').to_owned()
+}
+
+fn final_path(handle: HANDLE) -> Result<String, PlatformError> {
+    let mut buffer = vec![0u16; 1024];
+    let mut needed =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    if needed == 0 {
+        return Err(io_code());
+    }
+    if needed as usize >= buffer.len() {
+        buffer.resize(needed as usize + 1, 0);
+        needed = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        };
+        if needed == 0 || needed as usize >= buffer.len() {
+            return Err(PlatformError::Io("final path is too long".to_owned()));
+        }
+    }
+    let text = String::from_utf16_lossy(&buffer[..needed as usize]);
+    if text.is_empty() {
+        Err(PlatformError::Io("final path is empty".to_owned()))
+    } else {
+        Ok(text)
+    }
+}
+
+fn create_temp(parent: HANDLE) -> Result<OwnedHandle, PlatformError> {
+    let mut last = PlatformError::Io("temporary file could not be created".to_owned());
+    for _ in 0..4 {
+        let name = temp_component();
+        match create_child(
+            parent,
+            &name,
+            DELETE | FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        ) {
+            Ok(handle) => return Ok(handle),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+fn publish_handle(handle: HANDLE, bytes: &[u8]) -> Result<(), PlatformError> {
+    rewind(handle)?;
+    write_handle(handle, bytes)?;
+    let end = i64::try_from(bytes.len())
+        .map_err(|_| PlatformError::Io("file is too large".to_owned()))?;
+    let moved = unsafe { SetFilePointerEx(handle, end, ptr::null_mut(), 0) };
+    if moved == 0 {
+        return Err(io_code());
+    }
+    let truncated = unsafe { SetEndOfFile(handle) };
+    if truncated == 0 {
+        return Err(io_code());
+    }
+    flush_handle(handle)
+}
+
+fn list_handle(
+    handle: HANDLE,
+    max_entries: usize,
+) -> Result<Vec<(String, u64, bool, bool)>, PlatformError> {
+    if max_entries == 0 {
+        return Err(PlatformError::Io(
+            "directory listing limit is zero".to_owned(),
+        ));
+    }
+    let name_at = std::mem::offset_of!(
+        windows_sys::Wdk::Storage::FileSystem::FILE_BOTH_DIR_INFORMATION,
+        FileName
+    );
+    let end_at = std::mem::offset_of!(
+        windows_sys::Wdk::Storage::FileSystem::FILE_BOTH_DIR_INFORMATION,
+        EndOfFile
+    );
+    let attr_at = std::mem::offset_of!(
+        windows_sys::Wdk::Storage::FileSystem::FILE_BOTH_DIR_INFORMATION,
+        FileAttributes
+    );
+    let name_len_at = std::mem::offset_of!(
+        windows_sys::Wdk::Storage::FileSystem::FILE_BOTH_DIR_INFORMATION,
+        FileNameLength
+    );
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut restart = 1u8;
+    let mut entries = Vec::new();
+    loop {
+        let mut io = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                handle,
+                ptr::null_mut(),
+                None,
+                ptr::null(),
+                io.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len()).unwrap_or(0),
+                FileBothDirectoryInformation,
+                0,
+                ptr::null(),
+                restart,
+            )
+        };
+        restart = 0;
+        if status == STATUS_NO_MORE_FILES {
+            break;
+        }
+        if status < 0 {
+            return Err(PlatformError::Io(format!(
+                "directory query failed ({status:#x})"
+            )));
+        }
+        let written = unsafe { io.assume_init().Information };
+        if written == 0 {
+            break;
+        }
+        let slice = &buffer[..written.min(buffer.len())];
+        let mut offset = 0usize;
+        while offset + name_at <= slice.len() {
+            let next = read_u32(slice, offset)? as usize;
+            let attrs = read_u32(slice, offset + attr_at)?;
+            let name_bytes = read_u32(slice, offset + name_len_at)? as usize;
+            let end = read_i64(slice, offset + end_at)?;
+            let name_off = offset + name_at;
+            if name_bytes > 1024 || name_off.saturating_add(name_bytes) > slice.len() {
+                return Err(PlatformError::Io("directory entry is malformed".to_owned()));
+            }
+            let name = utf16_name(&slice[name_off..name_off + name_bytes])?;
+            if name != "." && name != ".." {
+                if entries.len() >= max_entries {
+                    return Err(PlatformError::Io(
+                        "directory is too large to list".to_owned(),
+                    ));
+                }
+                let size = u64::try_from(end.max(0)).unwrap_or(0);
+                entries.push((
+                    name,
+                    size,
+                    attrs & FILE_ATTRIBUTE_DIRECTORY != 0,
+                    attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                ));
+            }
+            if next == 0 {
+                break;
+            }
+            let Some(next_offset) = offset.checked_add(next) else {
+                return Err(PlatformError::Io("directory entry is malformed".to_owned()));
+            };
+            if next_offset > slice.len() {
+                return Err(PlatformError::Io("directory entry is malformed".to_owned()));
+            }
+            offset = next_offset;
+        }
+    }
+    Ok(entries)
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Result<u32, PlatformError> {
+    let chunk = bytes
+        .get(at..at + 4)
+        .ok_or_else(|| PlatformError::Io("directory entry is malformed".to_owned()))?;
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(chunk);
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn read_i64(bytes: &[u8], at: usize) -> Result<i64, PlatformError> {
+    let chunk = bytes
+        .get(at..at + 8)
+        .ok_or_else(|| PlatformError::Io("directory entry is malformed".to_owned()))?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(chunk);
+    Ok(i64::from_le_bytes(buf))
+}
+
+fn utf16_name(bytes: &[u8]) -> Result<String, PlatformError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(PlatformError::Io("directory entry is malformed".to_owned()));
+    }
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units)
+        .map_err(|_| PlatformError::Io("directory name is not Unicode".to_owned()))
+}
+
+const STATUS_SHARING_VIOLATION: i32 = 0xC000_0043u32 as i32;
+const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003Au32 as i32;
+const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC000_00BAu32 as i32;
+const STATUS_NOT_A_DIRECTORY: i32 = 0xC000_0103u32 as i32;
+const STATUS_NO_MORE_FILES: i32 = 0x8000_0006u32 as i32;
 
 fn query_handle(handle: HANDLE) -> Result<ObjectInfo, PlatformError> {
     let mut identity = FILE_ID_INFO {
@@ -596,13 +1007,6 @@ fn rewind(handle: HANDLE) -> Result<(), PlatformError> {
     if ok == 0 { Err(io_code()) } else { Ok(()) }
 }
 
-fn label(step: &'static str) -> impl Fn(PlatformError) -> PlatformError {
-    move |error| match error {
-        PlatformError::Io(message) => PlatformError::Io(format!("{step}: {message}")),
-        other => other,
-    }
-}
-
 fn flush_handle(handle: HANDLE) -> Result<(), PlatformError> {
     let ok = unsafe { FlushFileBuffers(handle) };
     if ok == 0 { Err(io_code()) } else { Ok(()) }
@@ -624,43 +1028,6 @@ fn dispose_handle(handle: HANDLE) {
     }
 }
 
-fn rename_over(file: HANDLE, parent: HANDLE, name: &[u16]) -> Result<(), PlatformError> {
-    let name_bytes = u32::try_from(name.len().saturating_mul(2))
-        .map_err(|_| PlatformError::Io("file name is too long".to_owned()))?;
-    #[repr(C)]
-    struct Header {
-        flags: u32,
-        root: HANDLE,
-        name_len: u32,
-    }
-    let name_at = std::mem::offset_of!(Header, name_len) + 4;
-    let mut buffer = vec![0u8; name_at + name_bytes as usize];
-    buffer[..4].copy_from_slice(&FILE_RENAME_REPLACE_IF_EXISTS.to_le_bytes());
-    let root = parent as usize;
-    buffer[8..16].copy_from_slice(&root.to_le_bytes());
-    buffer[name_at - 4..name_at].copy_from_slice(&name_bytes.to_le_bytes());
-    for (index, unit) in name.iter().enumerate() {
-        let start = name_at + index * 2;
-        buffer[start..start + 2].copy_from_slice(&unit.to_le_bytes());
-    }
-    let mut io = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
-    let status = unsafe {
-        NtSetInformationFile(
-            file,
-            io.as_mut_ptr(),
-            buffer.as_ptr().cast(),
-            u32::try_from(buffer.len()).unwrap_or(0),
-            FileRenameInformation,
-        )
-    };
-    if status < 0 {
-        return Err(PlatformError::Io(format!(
-            "rename status {status:#x} (name_at={name_at}, bytes={name_bytes})"
-        )));
-    }
-    Ok(())
-}
-
 fn wide_path(path: &Path) -> Result<Vec<u16>, PlatformError> {
     let mut wide: Vec<u16> = OsStr::new(path).encode_wide().collect();
     if wide.is_empty() || wide.len() > 32_000 {
@@ -680,7 +1047,30 @@ fn wide_component(name: &str) -> Result<Vec<u16>, PlatformError> {
 }
 
 fn valid_component(name: &str) -> bool {
-    !name.is_empty() && !name.contains(['/', '\\', ':', '\0']) && name != "." && name != ".."
+    if name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name.ends_with([' ', '.'])
+        || name.contains(['/', '\\', ':', '\0'])
+        || name.chars().any(|character| character.is_control())
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return false;
+    }
+    let bytes = upper.as_bytes();
+    if bytes.len() == 4
+        && (bytes.starts_with(b"COM") || bytes.starts_with(b"LPT"))
+        && bytes[3].is_ascii_digit()
+        && bytes[3] != b'0'
+    {
+        return false;
+    }
+    true
 }
 
 fn temp_component() -> Vec<u16> {

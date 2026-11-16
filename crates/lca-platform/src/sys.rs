@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{ObjectInfo, PlatformError};
+use crate::{ObjectInfo, PlatformError, PublishFailure, PublishPhase};
 
 #[cfg(windows)]
 #[path = "console.rs"]
@@ -36,8 +36,14 @@ impl OpenedTarget {
         self.inner.read(max)
     }
 
-    pub(crate) fn replace_with(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PlatformError> {
-        self.inner.replace_with(bytes)
+    pub(crate) fn replace_with(
+        &mut self,
+        bytes: &[u8],
+        root: &Path,
+        components: &[String],
+        hook: &mut dyn FnMut(PublishPhase) -> Result<(), PlatformError>,
+    ) -> Result<Vec<u8>, PublishFailure> {
+        self.inner.replace_with(bytes, root, components, hook)
     }
 }
 
@@ -47,6 +53,26 @@ pub(crate) fn inspect(path: &Path) -> Result<ObjectInfo, PlatformError> {
 
 pub(crate) fn open_tree(root: &Path, components: &[String]) -> Result<OpenedTarget, PlatformError> {
     imp::open_tree(root, components).map(|inner| OpenedTarget { inner })
+}
+
+pub(crate) fn stat_tree(root: &Path, components: &[String]) -> Result<ObjectInfo, PlatformError> {
+    imp::stat_tree(root, components)
+}
+
+pub(crate) fn read_tree(
+    root: &Path,
+    components: &[String],
+    max: u64,
+) -> Result<(ObjectInfo, Vec<u8>), PlatformError> {
+    imp::read_tree(root, components, max)
+}
+
+pub(crate) fn list_tree(
+    root: &Path,
+    components: &[String],
+    max_entries: usize,
+) -> Result<Vec<(String, u64, bool, bool)>, PlatformError> {
+    imp::list_tree(root, components, max_entries)
 }
 
 pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {

@@ -218,6 +218,15 @@ pub enum FsError {
         path: String,
     },
 
+    /// A test fault point fired. Production calls do not construct this.
+    #[error("injected fault {point}")]
+    FaultInjected {
+        /// Fault point name.
+        point: &'static str,
+        /// Whether the target bytes may already have changed.
+        published: bool,
+    },
+
     /// A filesystem call failed.
     #[error("filesystem error for {path}: {message}")]
     Io {
@@ -308,6 +317,7 @@ impl FsError {
             Self::Conflict { .. } => "conflict",
             Self::WriteFailed { .. } => "write_failed",
             Self::VerifyFailed { .. } => "verify_failed",
+            Self::FaultInjected { .. } => "fault_injected",
             Self::Io { .. } => "io",
             Self::UnsupportedTool { .. } => "unsupported_tool",
             Self::LedgerUnavailable => "ledger_unavailable",

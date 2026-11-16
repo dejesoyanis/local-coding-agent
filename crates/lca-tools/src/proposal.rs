@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::fs::{
-    ApplyResult, ApprovalGrant, ApprovalLedger, BoundFileId, FsLimits, PreparedPatch, StoredPatch,
-    apply_granted, restore_prepared,
+    ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, BoundFileId, FsLimits, PreparedPatch,
+    StoredPatch, apply_granted_controlled, restore_prepared,
 };
 use crate::fs_error::FsError;
 use crate::pathutil::paths_equivalent;
@@ -218,6 +218,21 @@ impl ProposalStore {
         shown_digest: &str,
         line: &str,
     ) -> Result<ApplyResult, FsError> {
+        self.approve_with(sandbox, limits, id, shown_digest, line, ApplyFault::none())
+    }
+
+    /// Same as [`Self::approve`], with one deterministic fault point.
+    ///
+    /// [`ApplyFault::None`] is what production commands pass. Any other value is a test.
+    pub fn approve_with(
+        &self,
+        sandbox: &WorkspaceSandbox,
+        limits: &FsLimits,
+        id: &str,
+        shown_digest: &str,
+        line: &str,
+        fault: ApplyFault,
+    ) -> Result<ApplyResult, FsError> {
         if !limits.write_enabled() {
             return Err(FsError::ToolDisabled {
                 tool: "apply_patch".to_owned(),
@@ -242,6 +257,12 @@ impl ProposalStore {
             if line != expected {
                 return Err(FsError::ApprovalRejected);
             }
+            if fault == ApplyFault::AfterValidation {
+                return Err(FsError::FaultInjected {
+                    point: "after_validation",
+                    published: false,
+                });
+            }
             let reloaded = self.load(workspace, &record.id.to_string())?;
             if reloaded.digest != record.digest {
                 return Err(FsError::ApprovalMismatch);
@@ -250,6 +271,12 @@ impl ProposalStore {
             record.state = State::Approved;
             self.write_record(workspace, record)?;
             self.audit(workspace, "approved", record)?;
+            if fault == ApplyFault::AfterApproval {
+                return Err(FsError::FaultInjected {
+                    point: "after_approval",
+                    published: false,
+                });
+            }
             let again = self.load(workspace, &record.id.to_string())?;
             if again.digest != record.digest || again.state != State::Approved {
                 return Err(FsError::ApprovalMismatch);
@@ -261,21 +288,52 @@ impl ProposalStore {
             self.audit(workspace, "apply_started", record)?;
             let prepared = record.to_prepared(sandbox)?;
             let grant = ApprovalGrant::issue(&prepared, &prepared.confirmation_line())?;
-            match apply_granted(sandbox, &prepared, grant, &ApprovalLedger::new()) {
+            let outcome = {
+                let mut trace = |event: &str| self.audit(workspace, event, record);
+                apply_granted_controlled(
+                    sandbox,
+                    &prepared,
+                    grant,
+                    &ApprovalLedger::new(),
+                    fault,
+                    &mut trace,
+                )
+            };
+            match outcome {
                 Ok(result) => {
+                    self.audit(workspace, "verified", record)?;
+                    if fault == ApplyFault::AfterVerification {
+                        return Err(FsError::FaultInjected {
+                            point: "after_verification",
+                            published: true,
+                        });
+                    }
                     record.state = State::Applied;
                     self.write_record(workspace, record)?;
+                    if fault == ApplyFault::BeforeAudit {
+                        return Err(FsError::FaultInjected {
+                            point: "before_audit",
+                            published: true,
+                        });
+                    }
                     self.audit(workspace, "apply_succeeded", record)?;
                     Ok(result)
                 }
                 Err(error) => {
                     record.state = state_after_failure(&error);
-                    let event = match record.state {
-                        State::Conflict => "conflict",
+                    let event = match &error {
+                        FsError::VerifyFailed { .. } => "verification_failed",
+                        FsError::FaultInjected {
+                            published: true, ..
+                        } => "state_unclear",
+                        FsError::Conflict { .. } | FsError::IdentityChanged { .. } => "conflict",
                         _ => "apply_failed",
                     };
                     self.write_record(workspace, record)?;
                     self.audit(workspace, event, record)?;
+                    if matches!(record.state, State::Unclear) && event != "state_unclear" {
+                        self.audit(workspace, "state_unclear", record)?;
+                    }
                     Err(error)
                 }
             }
@@ -321,35 +379,16 @@ impl ProposalStore {
             self.audit(workspace, "expired", record)?;
             return Ok(());
         }
-        if record.state != State::Applying {
+        if !matches!(record.state, State::Applying | State::Unclear) {
             return Ok(());
         }
-        let next = match sandbox.read_bytes(&record.relative_path, MAX_PROPOSED as u64) {
-            Ok(bytes) => {
-                let hash = sha256(&bytes);
-                if hash == record.proposed_hash {
-                    State::Applied
-                } else if hash == record.original_hash {
-                    match lca_platform::inspect(
-                        &sandbox.root().join(record.relative_path.replace('/', "\\")),
-                    ) {
-                        Ok(info)
-                            if info.file_id() == record.target_file_id
-                                && info.volume_serial() == record.target_volume =>
-                        {
-                            State::Failed
-                        }
-                        _ => State::Conflict,
-                    }
-                } else {
-                    State::Conflict
-                }
-            }
-            Err(_) => State::Conflict,
-        };
+        let next = classify_target(sandbox, record);
+        if next == record.state {
+            return Ok(());
+        }
         let event = match next {
-            State::Applied => "apply_succeeded",
-            State::Failed => "apply_failed",
+            State::Applied | State::Failed => "recovered",
+            State::Unclear => "state_unclear",
             _ => "conflict",
         };
         record.state = next;
@@ -531,6 +570,7 @@ enum State {
     Expired,
     Conflict,
     Failed,
+    Unclear,
 }
 
 impl State {
@@ -544,6 +584,7 @@ impl State {
             Self::Expired => "expired",
             Self::Conflict => "conflict",
             Self::Failed => "failed",
+            Self::Unclear => "unclear",
         }
     }
 
@@ -557,6 +598,7 @@ impl State {
             6 => Self::Expired,
             7 => Self::Conflict,
             8 => Self::Failed,
+            9 => Self::Unclear,
             _ => {
                 return Err(FsError::ProposalInvalid {
                     message: "proposal state is not recognized".to_owned(),
@@ -575,6 +617,7 @@ impl State {
             Self::Expired => 6,
             Self::Conflict => 7,
             Self::Failed => 8,
+            Self::Unclear => 9,
         }
     }
 }
@@ -592,6 +635,9 @@ fn transition(from: State, to: State) -> Result<(), FsError> {
             | (State::Applying, State::Applied)
             | (State::Applying, State::Failed)
             | (State::Applying, State::Conflict)
+            | (State::Applying, State::Unclear)
+            | (State::Unclear, State::Applied)
+            | (State::Unclear, State::Failed)
     );
     if allowed {
         Ok(())
@@ -603,9 +649,47 @@ fn transition(from: State, to: State) -> Result<(), FsError> {
 }
 
 fn state_after_failure(error: &FsError) -> State {
-    match error.kind() {
-        "verify_failed" | "conflict" | "identity_changed" => State::Conflict,
+    match error {
+        FsError::VerifyFailed { .. } => State::Unclear,
+        FsError::FaultInjected {
+            published: true, ..
+        } => State::Unclear,
+        FsError::Conflict { .. } | FsError::IdentityChanged { .. } => State::Conflict,
         _ => State::Failed,
+    }
+}
+
+fn classify_target(sandbox: &WorkspaceSandbox, record: &Record) -> State {
+    let components: Vec<String> = record
+        .relative_path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect();
+    let info = match lca_platform::stat_tree(sandbox.root(), &components) {
+        Ok(info) => info,
+        Err(_) => return State::Unclear,
+    };
+    if info.is_reparse()
+        || info.is_directory()
+        || info.link_count() != 1
+        || info.file_id() == [0; 16]
+    {
+        return State::Unclear;
+    }
+    let bytes = match sandbox.read_bytes(&record.relative_path, MAX_PROPOSED as u64) {
+        Ok(bytes) => bytes,
+        Err(_) => return State::Unclear,
+    };
+    let hash = sha256(&bytes);
+    let same_object =
+        info.file_id() == record.target_file_id && info.volume_serial() == record.target_volume;
+    if hash == record.proposed_hash && same_object {
+        State::Applied
+    } else if hash == record.original_hash && same_object {
+        State::Failed
+    } else {
+        State::Unclear
     }
 }
 
@@ -955,6 +1039,21 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(all(windows, test))]
+fn audit_text(state: &Path) -> String {
+    let mut found = String::new();
+    let audit = state.join("audit");
+    let Ok(workspaces) = fs::read_dir(audit) else {
+        return found;
+    };
+    for workspace in workspaces.flatten() {
+        if let Ok(bytes) = fs::read(workspace.path().join("events.log")) {
+            found.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,5 +1291,119 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(state);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn every_fault_point_records_the_bytes_that_are_actually_present() {
+        use crate::fs::ApplyFault;
+        let points = [
+            ApplyFault::AfterValidation,
+            ApplyFault::AfterApproval,
+            ApplyFault::AfterTempCreate,
+            ApplyFault::AfterWrite,
+            ApplyFault::BeforeRename,
+            ApplyFault::AfterRename,
+            ApplyFault::BeforeReadback,
+            ApplyFault::DuringReadback,
+            ApplyFault::AfterVerification,
+            ApplyFault::BeforeAudit,
+        ];
+        for fault in points {
+            let root = temp_workspace("fault");
+            let state = temp_workspace("fault-state");
+            let (sandbox, prepared) = prepare(&root);
+            let store = ProposalStore::open(&state).expect("store");
+            let saved = store.save(&sandbox, &prepared).expect("save");
+            let view = store.show(&sandbox, &saved.id).expect("show");
+            let error = store
+                .approve_with(
+                    &sandbox,
+                    &limits(),
+                    &saved.id,
+                    &view.digest,
+                    &view.confirmation,
+                    fault,
+                )
+                .expect_err("fault");
+            let bytes = fs::read(root.join("notes.txt")).expect("bytes");
+            let log_before = audit_text(&state);
+            let temps: Vec<_> = fs::read_dir(&root)
+                .expect("dir")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".lca-") || name.ends_with(".tmp"))
+                .collect();
+            assert!(temps.is_empty(), "{fault:?} left {temps:?}");
+            match fault {
+                ApplyFault::AfterValidation => {
+                    assert_eq!(error.kind(), "fault_injected");
+                    assert_eq!(bytes, b"alpha\n");
+                    assert_eq!(
+                        store.status(&sandbox, &saved.id).expect("status").state,
+                        "prepared"
+                    );
+                }
+                ApplyFault::AfterApproval => {
+                    assert_eq!(bytes, b"alpha\n");
+                    assert_eq!(
+                        store.status(&sandbox, &saved.id).expect("status").state,
+                        "approved"
+                    );
+                }
+                ApplyFault::AfterTempCreate | ApplyFault::AfterWrite | ApplyFault::BeforeRename => {
+                    assert_eq!(bytes, b"alpha\n");
+                    assert_eq!(
+                        store.status(&sandbox, &saved.id).expect("status").state,
+                        "failed",
+                        "{fault:?} {error}"
+                    );
+                }
+                ApplyFault::AfterRename
+                | ApplyFault::BeforeReadback
+                | ApplyFault::DuringReadback => {
+                    assert_eq!(bytes, b"beta\n", "{fault:?} {error}");
+                    if fault == ApplyFault::DuringReadback {
+                        assert_eq!(error.kind(), "verify_failed", "{error}");
+                        assert!(log_before.contains("verification_failed"), "{log_before}");
+                    } else {
+                        assert!(log_before.contains("state_unclear"), "{log_before}");
+                    }
+                    assert!(log_before.contains("\"state\":\"unclear\""), "{log_before}");
+                    let status = store.status(&sandbox, &saved.id).expect("status");
+                    assert_eq!(status.state, "applied", "{fault:?} was not recovered");
+                    let again = store.approve(
+                        &sandbox,
+                        &limits(),
+                        &saved.id,
+                        &view.digest,
+                        &view.confirmation,
+                    );
+                    assert!(again.is_err(), "recovery must not write again");
+                    assert_eq!(fs::read(root.join("notes.txt")).expect("stable"), b"beta\n");
+                }
+                ApplyFault::AfterVerification => {
+                    assert_eq!(bytes, b"beta\n");
+                    assert!(log_before.contains("verified"), "{log_before}");
+                    assert_eq!(
+                        store.status(&sandbox, &saved.id).expect("status").state,
+                        "applied"
+                    );
+                    assert_eq!(fs::read(root.join("notes.txt")).expect("stable"), b"beta\n");
+                }
+                ApplyFault::BeforeAudit => {
+                    assert_eq!(bytes, b"beta\n");
+                    assert!(log_before.contains("verified"), "{log_before}");
+                    assert!(!log_before.contains("apply_succeeded"), "{log_before}");
+                    assert_eq!(
+                        store.status(&sandbox, &saved.id).expect("status").state,
+                        "applied"
+                    );
+                }
+                ApplyFault::None => unreachable!("production fault is not in this table"),
+            }
+            let _ = fs::remove_dir_all(root);
+            let _ = fs::remove_dir_all(state);
+        }
     }
 }

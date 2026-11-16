@@ -33,9 +33,9 @@ pub use auth::{AuthorizationDecision, ToolAuthorization, WorkspaceScope};
 pub use error::{DenyReason, ToolError};
 pub use executor::{RejectingToolExecutor, ToolExecutor};
 pub use fs::{
-    ApplyResult, ApprovalGrant, ApprovalLedger, DirectoryEntry, FsLimitValues, FsLimits, FsOutcome,
-    ListResult, PreparedPatch, ReadResult, SearchMatch, SearchResult, apply_granted,
-    execute_validated,
+    ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, DirectoryEntry, FsLimitValues,
+    FsLimits, FsOutcome, ListResult, PreparedPatch, ReadResult, SearchMatch, SearchResult,
+    apply_granted, execute_validated,
 };
 pub use fs_error::FsError;
 pub use model::{ToolArguments, ToolName, ToolRequest, ToolResult};

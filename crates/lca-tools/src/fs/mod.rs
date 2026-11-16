@@ -19,8 +19,8 @@ pub use limits::{
     FsLimitValues, FsLimits,
 };
 pub use list::{DirectoryEntry, ListResult};
-pub use patch::{ApplyResult, ApprovalGrant, ApprovalLedger, PreparedPatch};
-pub(crate) use patch::{BoundFileId, StoredPatch, restore_prepared};
+pub use patch::{ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, PreparedPatch};
+pub(crate) use patch::{BoundFileId, StoredPatch, apply_granted_controlled, restore_prepared};
 pub use read::ReadResult;
 pub use search::{SearchMatch, SearchResult};
 

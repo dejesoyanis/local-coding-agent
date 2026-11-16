@@ -246,7 +246,7 @@ pub(crate) fn prepare_patch(
             path: resolved.relative().to_owned(),
         });
     }
-    let original = read_resolved_file(&resolved, limits.max_file_size_bytes())?;
+    let original = read_resolved_file(sandbox, &resolved, limits.max_file_size_bytes())?;
     let text = decode_text(&original, resolved.relative())?;
     let (ending, lines) = split_source(text)?;
     let updated = apply_hunks(&lines, &hunks)?;
@@ -261,7 +261,7 @@ pub(crate) fn prepare_patch(
     let original_hash = sha256(&original);
     let new_hash = sha256(&new_bytes);
     let patch_hash = sha256(patch.as_bytes());
-    let platform = capture_platform(resolved.absolute(), resolved.relative())?;
+    let platform = capture_platform(sandbox.root(), resolved.relative())?;
     let binding = compute_binding(
         action_id,
         &sandbox.root().to_string_lossy(),
@@ -290,11 +290,80 @@ pub(crate) fn prepare_patch(
     })
 }
 
+/// A single fault point for tests. [`ApplyFault::None`] is the production value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyFault {
+    /// No fault. This is the only value the CLI constructs.
+    None,
+    /// After the proposal digest and workspace checks, before approval is stored.
+    AfterValidation,
+    /// After approval is stored, before the apply starts.
+    AfterApproval,
+    /// After the temporary file is created.
+    AfterTempCreate,
+    /// After the temporary file holds the full byte image.
+    AfterWrite,
+    /// Immediately before the verified handle is overwritten.
+    BeforeRename,
+    /// Immediately after the verified handle has been flushed.
+    AfterRename,
+    /// Before the handle is read back.
+    BeforeReadback,
+    /// The read-back is treated as a mismatch after the bytes were published.
+    DuringReadback,
+    /// After the read-back matched, before the applied state is stored.
+    AfterVerification,
+    /// After the applied state is stored, before the success audit line.
+    BeforeAudit,
+}
+
+impl ApplyFault {
+    /// The production setting.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::None
+    }
+
+    const fn phase_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::None => return None,
+            Self::AfterValidation => "after_validation",
+            Self::AfterApproval => "after_approval",
+            Self::AfterTempCreate => "after_temp_create",
+            Self::AfterWrite => "after_write",
+            Self::BeforeRename => "before_rename",
+            Self::AfterRename => "after_rename",
+            Self::BeforeReadback => "before_readback",
+            Self::DuringReadback => "during_readback",
+            Self::AfterVerification => "after_verification",
+            Self::BeforeAudit => "before_audit",
+        })
+    }
+}
+
 pub(crate) fn apply_granted(
     sandbox: &WorkspaceSandbox,
     prepared: &PreparedPatch,
     grant: ApprovalGrant,
     ledger: &ApprovalLedger,
+) -> Result<ApplyResult, FsError> {
+    apply_granted_controlled(
+        sandbox,
+        prepared,
+        grant,
+        ledger,
+        ApplyFault::None,
+        &mut |_| Ok(()),
+    )
+}
+
+pub(crate) fn apply_granted_controlled(
+    sandbox: &WorkspaceSandbox,
+    prepared: &PreparedPatch,
+    grant: ApprovalGrant,
+    ledger: &ApprovalLedger,
+    fault: ApplyFault,
+    audit: &mut dyn FnMut(&str) -> Result<(), FsError>,
 ) -> Result<ApplyResult, FsError> {
     if grant.action_id != prepared.action_id || grant.binding != prepared.binding {
         return Err(FsError::ApprovalMismatch);
@@ -321,7 +390,7 @@ pub(crate) fn apply_granted(
             path: prepared.relative_path.clone(),
         });
     }
-    let current = read_capped(&resolved, &prepared.relative_path)?;
+    let current = read_capped(sandbox, &resolved, &prepared.relative_path)?;
     if sha256(&current) != prepared.original_hash {
         return Err(FsError::Conflict {
             path: prepared.relative_path.clone(),
@@ -340,7 +409,7 @@ pub(crate) fn apply_granted(
 
     #[cfg(windows)]
     {
-        apply_ntfs(prepared, &mut used)?;
+        apply_ntfs(prepared, &mut used, fault, audit)?;
         Ok(ApplyResult {
             path: prepared.relative_path.clone(),
             new_hash: hex_encode(&prepared.new_hash),
@@ -348,6 +417,8 @@ pub(crate) fn apply_granted(
     }
     #[cfg(not(windows))]
     {
+        refuse_armed_fault(fault)?;
+        let _ = audit;
         let parent = resolved
             .absolute()
             .parent()
@@ -406,7 +477,7 @@ pub(crate) fn apply_granted(
                 path: prepared.relative_path.clone(),
             });
         }
-        let reread = read_capped(&resolved, &prepared.relative_path)?;
+        let reread = read_capped(sandbox, &resolved, &prepared.relative_path)?;
         if sha256(&reread) != prepared.original_hash {
             return Err(FsError::Conflict {
                 path: prepared.relative_path.clone(),
@@ -421,9 +492,10 @@ pub(crate) fn apply_granted(
         cleanup.armed = false;
 
         let written = sandbox.resolve(&prepared.relative_path)?;
-        let bytes = read_resolved_file(&written, READ_CAP).map_err(|_| FsError::VerifyFailed {
-            path: prepared.relative_path.clone(),
-        })?;
+        let bytes =
+            read_resolved_file(sandbox, &written, READ_CAP).map_err(|_| FsError::VerifyFailed {
+                path: prepared.relative_path.clone(),
+            })?;
         if sha256(&bytes) != prepared.new_hash {
             return Err(FsError::VerifyFailed {
                 path: prepared.relative_path.clone(),
@@ -438,8 +510,12 @@ pub(crate) fn apply_granted(
 
 const READ_CAP: u64 = 16 * 1024 * 1024;
 
-fn read_capped(resolved: &crate::sandbox::ResolvedPath, path: &str) -> Result<Vec<u8>, FsError> {
-    match read_resolved_file(resolved, READ_CAP) {
+fn read_capped(
+    sandbox: &WorkspaceSandbox,
+    resolved: &crate::sandbox::ResolvedPath,
+    path: &str,
+) -> Result<Vec<u8>, FsError> {
+    match read_resolved_file(sandbox, resolved, READ_CAP) {
         Ok(bytes) => Ok(bytes),
         Err(FsError::TooLarge { .. }) => Err(FsError::Conflict {
             path: path.to_owned(),
@@ -861,8 +937,13 @@ fn compute_binding(
     sha256(&buffer)
 }
 
-fn capture_platform(path: &Path, relative: &str) -> Result<BoundFileId, FsError> {
-    match lca_platform::inspect(path) {
+fn capture_platform(root: &Path, relative: &str) -> Result<BoundFileId, FsError> {
+    let components: Vec<String> = relative
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect();
+    match lca_platform::stat_tree(root, &components) {
         Ok(info) => {
             if info.is_reparse() {
                 return Err(FsError::ReparseDenied {
@@ -895,10 +976,24 @@ fn capture_platform(path: &Path, relative: &str) -> Result<BoundFileId, FsError>
     }
 }
 
+#[cfg(not(windows))]
+fn refuse_armed_fault(fault: ApplyFault) -> Result<(), FsError> {
+    if let Some(point) = fault.phase_name() {
+        Err(FsError::FaultInjected {
+            point,
+            published: false,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 fn apply_ntfs(
     prepared: &PreparedPatch,
     used: &mut std::collections::HashSet<[u8; 32]>,
+    fault: ApplyFault,
+    audit: &mut dyn FnMut(&str) -> Result<(), FsError>,
 ) -> Result<(), FsError> {
     if prepared.platform.file_id == [0; 16] {
         return Err(FsError::UnverifiableIdentity {
@@ -940,15 +1035,93 @@ fn apply_ntfs(
         });
     }
     used.insert(prepared.binding);
-    let readback = opened
-        .replace_with(&prepared.new_bytes)
-        .map_err(|error| map_platform(&prepared.relative_path, error))?;
+    let mut injected = None;
+    let mut audit_error = None;
+    let mut hook = |phase: lca_platform::PublishPhase| -> Result<(), lca_platform::PlatformError> {
+        if fault_matches(fault, phase) {
+            injected = Some(fault.phase_name().unwrap_or("fault"));
+            return Err(if phase == lca_platform::PublishPhase::DuringReadback {
+                lca_platform::PlatformError::Verify
+            } else {
+                lca_platform::PlatformError::Injected
+            });
+        }
+        let event = match phase {
+            lca_platform::PublishPhase::BeforeRename => Some("mutation_started"),
+            lca_platform::PublishPhase::AfterRename => Some("mutation_published"),
+            _ => None,
+        };
+        if let Some(event) = event
+            && let Err(error) = audit(event)
+        {
+            audit_error = Some(error);
+            return Err(lca_platform::PlatformError::Io(
+                "audit record could not be written".to_owned(),
+            ));
+        }
+        Ok(())
+    };
+    let replaced = opened.replace_with(
+        &prepared.new_bytes,
+        &prepared.workspace_root,
+        &components,
+        &mut hook,
+    );
+    let readback = replaced.map_err(|failure| {
+        if let Some(error) = audit_error.take() {
+            return error;
+        }
+        map_publish(&prepared.relative_path, failure, injected.take())
+    })?;
     if sha256(&readback) != prepared.new_hash {
         return Err(FsError::VerifyFailed {
             path: prepared.relative_path.clone(),
         });
     }
     Ok(())
+}
+
+fn fault_matches(fault: ApplyFault, phase: lca_platform::PublishPhase) -> bool {
+    matches!(
+        (fault, phase),
+        (
+            ApplyFault::AfterTempCreate,
+            lca_platform::PublishPhase::AfterTempCreate
+        ) | (
+            ApplyFault::AfterWrite,
+            lca_platform::PublishPhase::AfterWrite
+        ) | (
+            ApplyFault::BeforeRename,
+            lca_platform::PublishPhase::BeforeRename
+        ) | (
+            ApplyFault::AfterRename,
+            lca_platform::PublishPhase::AfterRename
+        ) | (
+            ApplyFault::BeforeReadback,
+            lca_platform::PublishPhase::BeforeReadback
+        ) | (
+            ApplyFault::DuringReadback,
+            lca_platform::PublishPhase::DuringReadback
+        )
+    )
+}
+
+fn map_publish(
+    path: &str,
+    failure: lca_platform::PublishFailure,
+    injected: Option<&'static str>,
+) -> FsError {
+    let published = failure.published();
+    match failure.error() {
+        lca_platform::PlatformError::Verify => FsError::VerifyFailed {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Injected => FsError::FaultInjected {
+            point: injected.unwrap_or("fault"),
+            published,
+        },
+        other => map_platform(path, other.clone()),
+    }
 }
 
 fn map_platform(path: &str, error: lca_platform::PlatformError) -> FsError {
@@ -962,6 +1135,19 @@ fn map_platform(path: &str, error: lca_platform::PlatformError) -> FsError {
         },
         lca_platform::PlatformError::Identity => FsError::IdentityChanged {
             path: path.to_owned(),
+        },
+        lca_platform::PlatformError::NotFound => FsError::NotFound {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::NotFile => FsError::NotAFile {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Verify => FsError::VerifyFailed {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Injected => FsError::FaultInjected {
+            point: "fault",
+            published: false,
         },
         lca_platform::PlatformError::Sharing => FsError::WriteFailed {
             path: path.to_owned(),

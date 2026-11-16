@@ -1,8 +1,8 @@
 //! Name-based privacy boundary for workspace paths.
 //!
 //! The baseline names are always enforced. Extra patterns from configuration can only
-//! add denials. This is not a file-identity check: a hard link under another name is
-//! not recognized, and a check-then-open race is not closed.
+//! add denials. Name matching is case-insensitive and happens before a path is opened.
+//! A second hard link is refused by the read path; this module does not see file bytes.
 
 use crate::fs_error::FsError;
 

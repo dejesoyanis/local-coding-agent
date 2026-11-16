@@ -31,7 +31,7 @@ pub(crate) fn read_file(
             path: display_path(path),
         });
     }
-    let bytes = read_resolved_file(&resolved, limits.max_file_size_bytes())?;
+    let bytes = read_resolved_file(sandbox, &resolved, limits.max_file_size_bytes())?;
     if bytes.contains(&0) {
         return Err(FsError::BinaryFile {
             path: resolved.relative().to_owned(),
