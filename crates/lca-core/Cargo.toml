@@ -3,14 +3,19 @@ name = "lca-core"
 version.workspace = true
 edition.workspace = true
 publish = false
-description = "Domain types for the local coding agent lifecycle."
+description = "Domain types and the single-turn agent controller."
 
 [dependencies]
+lca-model-runtime = { path = "../lca-model-runtime" }
 lca-tools = { path = "../lca-tools" }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

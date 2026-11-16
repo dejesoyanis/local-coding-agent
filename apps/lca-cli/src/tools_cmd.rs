@@ -190,7 +190,7 @@ fn open_workspace(config: &Path) -> Result<(WorkspaceSandbox, FsLimits), String>
     Ok((sandbox, limits))
 }
 
-fn limits_from(config: &AgentConfig) -> Result<FsLimits, String> {
+pub(crate) fn limits_from(config: &AgentConfig) -> Result<FsLimits, String> {
     FsLimits::try_new(FsLimitValues {
         read_enabled: config.tool_read_enabled(),
         write_enabled: config.tool_write_enabled(),

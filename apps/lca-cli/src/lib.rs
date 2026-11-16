@@ -4,12 +4,14 @@
 //! Status probes Ollama and reports an unavailable server without panicking. `tools probe`
 //! validates a structured tool call and does not execute it. `tools list`, `tools read`,
 //! and `tools search` run inside the workspace sandbox. `tools patch prepare` writes only
-//! after a confirmation line read in that same process. This binary does not start an
-//! agent loop and does not run a shell.
+//! after a confirmation line read in that same process. `agent run` calls the model once
+//! and dispatches at most one validated tool batch. It does not start an agent loop, does
+//! not write, and does not run a shell.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+mod agent;
 mod ask;
 mod probe;
 mod tools_cmd;
@@ -105,6 +107,13 @@ where
             model,
             prompt,
         }),
+        Command::Agent {
+            action: AgentCli::Run { protocol, prompt },
+        } => Invocation::Buffered(agent::run_agent(&agent::AgentCommand {
+            config: config_path,
+            protocol: protocol.preference(),
+            prompt,
+        })),
         Command::Tools { action } => match action {
             ToolsAction::Probe { protocol } => {
                 Invocation::Buffered(probe::run_probe(&probe::ProbeCommand {
@@ -188,6 +197,11 @@ enum Command {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
+    /// Run one model turn and dispatch a validated tool batch.
+    Agent {
+        #[command(subcommand)]
+        action: AgentCli,
+    },
     /// Stream an answer from the configured local model.
     Ask {
         /// Model name. Overrides the configuration file for this call.
@@ -201,6 +215,19 @@ enum Command {
     Tools {
         #[command(subcommand)]
         action: ToolsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCli {
+    /// Call the model once. Read tools may run. A patch is prepared and not written.
+    Run {
+        /// `native`, `json`, or `auto`. The default is `auto`.
+        #[arg(long, value_enum, default_value = "auto")]
+        protocol: CliProtocol,
+        /// Task for the model.
+        #[arg(value_name = "PROMPT")]
+        prompt: String,
     },
 }
 

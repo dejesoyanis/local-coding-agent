@@ -748,9 +748,12 @@ dependencies = [
 name = "lca-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "lca-model-runtime",
  "lca-tools",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "uuid",
 ]

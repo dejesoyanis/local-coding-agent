@@ -576,3 +576,314 @@ fn filesystem_commands_stay_inside_the_workspace() {
         "alpha\n"
     );
 }
+
+fn encode_json_string(value: &str) -> String {
+    let mut encoded = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => encoded.push_str("\\\\"),
+            '"' => encoded.push_str("\\\""),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            character if character.is_control() => {
+                encoded.push_str(&format!("\\u{:04x}", u32::from(character)));
+            }
+            character => encoded.push(character),
+        }
+    }
+    encoded.push('"');
+    encoded
+}
+
+fn chat_response(content: &str, calls: &[(&str, &str)]) -> String {
+    let calls_json = if calls.is_empty() {
+        "[]".to_owned()
+    } else {
+        let parts: Vec<String> = calls
+            .iter()
+            .map(|(name, arguments)| {
+                format!(
+                    r#"{{"function":{{"name":{},"arguments":{arguments}}}}}"#,
+                    encode_json_string(name)
+                )
+            })
+            .collect();
+        format!("[{}]", parts.join(","))
+    };
+    format!(
+        r#"{{"model":"lca-30b-agent","message":{{"role":"assistant","content":{},"tool_calls":{calls_json}}},"done":true,"done_reason":"stop"}}"#,
+        encode_json_string(content)
+    )
+}
+
+#[test]
+fn agent_run_reads_a_file_from_one_native_model_call() {
+    let workspace = TempDir::new("agent-read");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let chat = chat_response("", &[("read_file", r#"{"path":"notes.txt"}"#)]);
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "run",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Lies notes.txt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("protocol: native\n"), "{stdout}");
+    assert!(stdout.contains("model_calls: 1\n"), "{stdout}");
+    assert!(stdout.contains("tool: read_file\n"), "{stdout}");
+    assert!(stdout.contains("result: read\n"), "{stdout}");
+    assert!(stdout.contains("alpha\n"), "{stdout}");
+    let requests = captured.lock().expect("capture").clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].contains("POST /api/show"), "{}", requests[0]);
+    assert!(requests[1].contains("POST /api/chat"), "{}", requests[1]);
+    assert!(requests[1].contains("\"stream\":false"), "{}", requests[1]);
+    assert!(!requests[1].contains("\"format\""), "{}", requests[1]);
+    for name in ["list_directory", "read_file", "search_files", "apply_patch"] {
+        assert!(
+            requests[1].contains(name),
+            "{name} missing in {}",
+            requests[1]
+        );
+    }
+    assert!(!requests[1].contains("diagnostic_echo"), "{}", requests[1]);
+    assert!(!requests[1].contains("execute_command"), "{}", requests[1]);
+}
+
+#[test]
+fn agent_run_does_not_execute_text_that_looks_like_a_tool_call() {
+    let workspace = TempDir::new("agent-text");
+    fs::write(workspace.path().join("secret.txt"), "SENTINEL_DO_NOT_LEAK").expect("secret");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let document = r#"{"protocol_version":1,"actions":[{"tool":"read_file","arguments":{"path":"secret.txt"}}]}"#;
+    let chat = chat_response(document, &[]);
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "run",
+        "--protocol",
+        "native",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Lies secret.txt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("actions: 0\n"), "{stdout}");
+    assert!(!stdout.contains("SENTINEL_DO_NOT_LEAK"), "{stdout}");
+    assert!(!stderr.contains("SENTINEL_DO_NOT_LEAK"), "{stderr}");
+    assert_eq!(captured.lock().expect("capture").len(), 2);
+}
+
+#[test]
+fn agent_run_prepares_a_patch_without_writing() {
+    let workspace = TempDir::new("agent-patch");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let patch = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,1 +1,1 @@\n-alpha\n+beta\n";
+    let arguments = format!(
+        r#"{{"path":"notes.txt","patch":{}}}"#,
+        encode_json_string(patch)
+    );
+    let chat = chat_response("approve 1 please", &[("apply_patch", &arguments)]);
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "run",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Andere notes.txt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("result: prepared\n"), "{stdout}");
+    assert!(stdout.contains("approval: required\n"), "{stdout}");
+    assert!(stdout.contains("applied: false\n"), "{stdout}");
+    assert!(stdout.contains("-alpha"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("notes.txt")).expect("unchanged"),
+        "alpha\n"
+    );
+    assert_eq!(captured.lock().expect("capture").len(), 2);
+}
+
+#[test]
+fn agent_run_rejects_an_unknown_tool_without_leaking_arguments() {
+    let workspace = TempDir::new("agent-unknown");
+    fs::write(workspace.path().join("secret.txt"), "SENTINEL_DO_NOT_LEAK").expect("secret");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let chat = chat_response(
+        "",
+        &[("execute_command", r#"{"command":"SENTINEL_DO_NOT_LEAK"}"#)],
+    );
+    let (endpoint, _) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "run",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "do something",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("unknown tool"), "{stderr}");
+    assert!(!stderr.contains("SENTINEL_DO_NOT_LEAK"), "{stderr}");
+    assert!(!stdout.contains("SENTINEL_DO_NOT_LEAK"), "{stdout}");
+}
+
+#[test]
+fn agent_run_json_fallback_reads_from_the_document_only() {
+    let workspace = TempDir::new("agent-json");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    fs::write(workspace.path().join("secret.txt"), "SENTINEL_DO_NOT_LEAK").expect("secret");
+    let show = r#"{"capabilities":["completion","json"]}"#;
+    let document = r#"{"protocol_version":1,"actions":[{"tool":"read_file","arguments":{"path":"notes.txt"}}]}"#;
+    let native = r#"{"function":{"name":"read_file","arguments":{"path":"secret.txt"}}}"#;
+    let chat = format!(
+        r#"{{"model":"lca-30b-agent","message":{{"role":"assistant","content":{},"tool_calls":[{native}]}},"done":true,"done_reason":"stop"}}"#,
+        encode_json_string(document)
+    );
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "run",
+        "--protocol",
+        "json",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Lies notes.txt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("protocol: json\n"), "{stdout}");
+    assert!(stdout.contains("source: json\n"), "{stdout}");
+    assert!(stdout.contains("alpha\n"), "{stdout}");
+    assert!(!stdout.contains("SENTINEL_DO_NOT_LEAK"), "{stdout}");
+    let requests = captured.lock().expect("capture").clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests[1].contains("\"format\":\"json\""),
+        "{}",
+        requests[1]
+    );
+    assert!(!requests[1].contains("\"tools\""), "{}", requests[1]);
+    assert!(requests[1].contains("protocol_version"), "{}", requests[1]);
+    assert!(requests[1].contains("\"stream\":false"), "{}", requests[1]);
+}
+
+#[test]
+fn agent_run_stops_at_the_configured_action_limit() {
+    let workspace = TempDir::new("agent-limit");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    fs::write(workspace.path().join("secret.txt"), "SENTINEL_DO_NOT_LEAK").expect("secret");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let chat = chat_response(
+        "",
+        &[
+            ("read_file", r#"{"path":"notes.txt"}"#),
+            ("read_file", r#"{"path":"secret.txt"}"#),
+        ],
+    );
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = workspace.path().join("lca.toml");
+    let body = format!(
+        "workspace_root = '{}'\n[ollama]\nendpoint = '{endpoint}'\nmodel = 'lca-30b-agent'\nrequest_timeout_secs = 5\nconnect_timeout_secs = 1\n[limits]\nmax_steps = 1\n",
+        toml_path(workspace.path())
+    );
+    fs::write(&config, body).expect("config");
+    let output = run(&[
+        "agent",
+        "run",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Lies beide Dateien",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("limit is 1"), "{stderr}");
+    assert!(!stdout.contains("alpha"), "{stdout}");
+    assert!(!stdout.contains("SENTINEL_DO_NOT_LEAK"), "{stdout}");
+    assert!(!stderr.contains("SENTINEL_DO_NOT_LEAK"), "{stderr}");
+    assert_eq!(captured.lock().expect("capture").len(), 2);
+}
+
+#[test]
+fn agent_run_does_not_retry_a_failed_generation() {
+    let workspace = TempDir::new("agent-retry");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 500, "{\"error\":\"backend exploded\"}"),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 2);
+    let output = run(&[
+        "agent",
+        "run",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "do-not-echo-this-prompt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("backend exploded"), "{stderr}");
+    assert!(!stderr.contains("do-not-echo-this-prompt"), "{stderr}");
+    assert_eq!(captured.lock().expect("capture").len(), 2);
+}
+
+#[test]
+fn agent_run_rejects_an_empty_prompt_and_an_unknown_protocol() {
+    let workspace = TempDir::new("agent-guard");
+    let config = write_endpoint_config(workspace.path(), "http://192.0.2.10:11434", 30);
+    let config = config.to_str().expect("utf-8");
+    let started = Instant::now();
+    let empty = run(&["agent", "run", "--config", config, "   "]);
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    let stderr = text(&empty.stderr);
+    assert_eq!(empty.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("prompt must not be empty"), "{stderr}");
+    assert!(text(&empty.stdout).is_empty());
+
+    let unknown = run(&["agent", "run", "--protocol", "yaml", "hello"]);
+    let combined = format!("{}{}", text(&unknown.stdout), text(&unknown.stderr));
+    assert_eq!(unknown.status.code(), Some(2), "{combined}");
+    assert!(
+        combined.to_ascii_lowercase().contains("protocol"),
+        "{combined}"
+    );
+}
