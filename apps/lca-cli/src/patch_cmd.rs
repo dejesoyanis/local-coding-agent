@@ -8,7 +8,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use lca_config::load_from_path;
-use lca_tools::{ProposalStore, ProposalSummary, ProposalView};
+use lca_tools::{ProposalInspection, ProposalStore, ProposalSummary, ProposalView};
 
 use crate::CommandOutput;
 use crate::tools_cmd::{limits_from, sandbox_from};
@@ -70,6 +70,34 @@ pub(crate) fn run_reject(config: &Path, id: &str) -> CommandOutput {
             Ok(summary) => CommandOutput {
                 exit_code: 0,
                 stdout: render_summary(&summary),
+                stderr: String::new(),
+            },
+            Err(error) => failure(&error.to_string()),
+        },
+        Err(output) => output,
+    }
+}
+
+pub(crate) fn run_inspect(config: &Path, id: &str) -> CommandOutput {
+    match open_store(config) {
+        Ok((sandbox, store)) => match store.inspect(&sandbox, id) {
+            Ok(report) => CommandOutput {
+                exit_code: 0,
+                stdout: render_inspection(&report),
+                stderr: String::new(),
+            },
+            Err(error) => failure(&error.to_string()),
+        },
+        Err(output) => output,
+    }
+}
+
+pub(crate) fn run_recover(config: &Path, id: &str) -> CommandOutput {
+    match open_store(config) {
+        Ok((sandbox, store)) => match store.recover(&sandbox, id) {
+            Ok(report) => CommandOutput {
+                exit_code: 0,
+                stdout: render_inspection(&report),
                 stderr: String::new(),
             },
             Err(error) => failure(&error.to_string()),
@@ -158,6 +186,34 @@ fn render_list(rows: &[ProposalSummary]) -> String {
         out.push('\n');
         out.push_str(&render_summary(row));
     }
+    out
+}
+
+fn render_inspection(report: &ProposalInspection) -> String {
+    let mut out = String::new();
+    push(&mut out, "proposal_id", &report.id);
+    push(&mut out, "path", &report.path);
+    push(&mut out, "proposal_state", &report.stored_state);
+    push(&mut out, "observed", &report.observed);
+    push(&mut out, "original_hash", &report.original_hash);
+    push(&mut out, "proposed_hash", &report.proposed_hash);
+    push(&mut out, "current_hash", &report.current_hash);
+    push(&mut out, "recorded_file_id", &report.recorded_file_id);
+    push(&mut out, "current_file_id", &report.current_file_id);
+    push(&mut out, "strategy", &report.strategy);
+    push(&mut out, "attempt_id", &report.attempt_id);
+    push(&mut out, "evidence_phase", &report.evidence_phase);
+    push(&mut out, "stage_complete", &report.stage_complete);
+    push(&mut out, "mutation_started", &report.mutation_started);
+    push(
+        &mut out,
+        "publication_complete",
+        &report.publication_complete,
+    );
+    push(&mut out, "verification", &report.verification);
+    push(&mut out, "recovery", &report.recovery);
+    push(&mut out, "conflict", &report.conflict);
+    push(&mut out, "next_step", &report.next_step);
     out
 }
 

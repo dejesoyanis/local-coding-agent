@@ -5,6 +5,7 @@
 //! identifies the reviewed bytes; it is not an authentication key. `approve` writes only
 //! through [`crate::fs::apply_granted`] after a fresh human confirmation.
 
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,8 +15,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::fs::{
-    ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, BoundFileId, FsLimits, PreparedPatch,
-    StoredPatch, apply_granted_controlled, restore_prepared,
+    ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, BoundFileId, FsLimits, KillHold,
+    PreparedPatch, StoredPatch, apply_granted_controlled, restore_prepared,
 };
 use crate::fs_error::FsError;
 use crate::pathutil::paths_equivalent;
@@ -62,6 +63,49 @@ pub struct ProposalView {
     pub file_id: String,
     /// `matches_original`, `matches_proposed`, `changed`, `unreadable`, or `unchecked`.
     pub target_status: String,
+}
+
+/// Read-only publication report. It does not contain file bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalInspection {
+    /// Proposal UUID.
+    pub id: String,
+    /// Workspace-relative target.
+    pub path: String,
+    /// State stored before this read. `inspect` does not change it.
+    pub stored_state: String,
+    /// `matches_original`, `matches_proposed`, `matches_neither`, `identity_differs`, or `unreadable`.
+    pub observed: String,
+    /// SHA-256 of the bytes that were approved as the original.
+    pub original_hash: String,
+    /// SHA-256 of the proposed bytes.
+    pub proposed_hash: String,
+    /// SHA-256 of the bytes read now, or `unreadable`.
+    pub current_hash: String,
+    /// File id stored with the approval.
+    pub recorded_file_id: String,
+    /// File id opened now, or `unreadable`.
+    pub current_file_id: String,
+    /// Publication strategy name, or `absent`.
+    pub strategy: String,
+    /// One attempt id, or `absent`.
+    pub attempt_id: String,
+    /// Evidence phase, or `absent`.
+    pub evidence_phase: String,
+    /// Whether the staged image was flushed.
+    pub stage_complete: String,
+    /// Whether publication had started.
+    pub mutation_started: String,
+    /// Whether the target flush completed.
+    pub publication_complete: String,
+    /// `unknown`, `match`, `mismatch`, or `absent`.
+    pub verification: String,
+    /// `none`, `applied`, `failed`, `unclear`, or `absent`.
+    pub recovery: String,
+    /// Why the target is not a clean original or proposed image.
+    pub conflict: String,
+    /// What a person can do next. This never reuses the old approval.
+    pub next_step: String,
 }
 
 /// Protected proposal directory.
@@ -195,6 +239,29 @@ impl ProposalStore {
         self.with_record(sandbox, id, true, |record, _workspace| Ok(record.summary()))
     }
 
+    /// Reports proposal, evidence, and target hashes. It does not write the proposal or the target.
+    pub fn inspect(
+        &self,
+        sandbox: &WorkspaceSandbox,
+        id: &str,
+    ) -> Result<ProposalInspection, FsError> {
+        self.with_record(sandbox, id, false, |record, workspace| {
+            Ok(self.inspection(sandbox, workspace, record))
+        })
+    }
+
+    /// Reconciles `Applying` or `Unclear` from the target bytes. It does not write the target.
+    pub fn recover(
+        &self,
+        sandbox: &WorkspaceSandbox,
+        id: &str,
+    ) -> Result<ProposalInspection, FsError> {
+        self.with_record(sandbox, id, true, |record, workspace| {
+            let _ = self.mark_recovery(workspace, record);
+            Ok(self.inspection(sandbox, workspace, record))
+        })
+    }
+
     /// Marks a prepared or approved proposal rejected.
     pub fn reject(&self, sandbox: &WorkspaceSandbox, id: &str) -> Result<ProposalSummary, FsError> {
         self.with_record(sandbox, id, true, |record, workspace| {
@@ -218,7 +285,15 @@ impl ProposalStore {
         shown_digest: &str,
         line: &str,
     ) -> Result<ApplyResult, FsError> {
-        self.approve_with(sandbox, limits, id, shown_digest, line, ApplyFault::none())
+        self.approve_inner(
+            sandbox,
+            limits,
+            id,
+            shown_digest,
+            line,
+            ApplyFault::none(),
+            None,
+        )
     }
 
     /// Same as [`Self::approve`], with one deterministic fault point.
@@ -232,6 +307,41 @@ impl ProposalStore {
         shown_digest: &str,
         line: &str,
         fault: ApplyFault,
+    ) -> Result<ApplyResult, FsError> {
+        self.approve_inner(sandbox, limits, id, shown_digest, line, fault, None)
+    }
+
+    /// Applies until `hold` and then parks. The `lca` binary does not call this.
+    pub fn approve_holding(
+        &self,
+        sandbox: &WorkspaceSandbox,
+        limits: &FsLimits,
+        id: &str,
+        shown_digest: &str,
+        line: &str,
+        hold: &KillHold,
+    ) -> Result<ApplyResult, FsError> {
+        self.approve_inner(
+            sandbox,
+            limits,
+            id,
+            shown_digest,
+            line,
+            ApplyFault::none(),
+            Some(hold),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn approve_inner(
+        &self,
+        sandbox: &WorkspaceSandbox,
+        limits: &FsLimits,
+        id: &str,
+        shown_digest: &str,
+        line: &str,
+        fault: ApplyFault,
+        hold: Option<&KillHold>,
     ) -> Result<ApplyResult, FsError> {
         if !limits.write_enabled() {
             return Err(FsError::ToolDisabled {
@@ -257,6 +367,9 @@ impl ProposalStore {
             if line != expected {
                 return Err(FsError::ApprovalRejected);
             }
+            if let Some(hold) = hold {
+                hold.park_at(ApplyFault::AfterValidation);
+            }
             if fault == ApplyFault::AfterValidation {
                 return Err(FsError::FaultInjected {
                     point: "after_validation",
@@ -271,6 +384,9 @@ impl ProposalStore {
             record.state = State::Approved;
             self.write_record(workspace, record)?;
             self.audit(workspace, "approved", record)?;
+            if let Some(hold) = hold {
+                hold.park_at(ApplyFault::AfterApproval);
+            }
             if fault == ApplyFault::AfterApproval {
                 return Err(FsError::FaultInjected {
                     point: "after_approval",
@@ -288,20 +404,50 @@ impl ProposalStore {
             self.audit(workspace, "apply_started", record)?;
             let prepared = record.to_prepared(sandbox)?;
             let grant = ApprovalGrant::issue(&prepared, &prepared.confirmation_line())?;
+            let sealed = RefCell::new(None);
             let outcome = {
-                let mut trace = |event: &str| self.audit(workspace, event, record);
+                let mut preimage = |bytes: &[u8]| {
+                    if sha256(bytes) != record.original_hash {
+                        return Err(FsError::Conflict {
+                            path: record.relative_path.clone(),
+                        });
+                    }
+                    let evidence = Evidence::intent(record, bytes);
+                    self.write_evidence(workspace, &evidence)?;
+                    *sealed.borrow_mut() = Some(evidence);
+                    Ok(())
+                };
+                let mut trace = |event: &str| {
+                    self.audit(workspace, event, record)?;
+                    if let Some(evidence) = sealed.borrow_mut().as_mut() {
+                        evidence.observe(event);
+                        self.write_evidence(workspace, evidence)?;
+                    }
+                    Ok(())
+                };
                 apply_granted_controlled(
                     sandbox,
                     &prepared,
                     grant,
                     &ApprovalLedger::new(),
                     fault,
+                    hold,
+                    &mut preimage,
                     &mut trace,
                 )
             };
             match outcome {
                 Ok(result) => {
                     self.audit(workspace, "verified", record)?;
+                    if let Err(error) = self.note_verified(sandbox, workspace, record, &sealed) {
+                        record.state = State::Unclear;
+                        self.write_record(workspace, record)?;
+                        self.audit(workspace, "state_unclear", record)?;
+                        return Err(error);
+                    }
+                    if let Some(hold) = hold {
+                        hold.park_at(ApplyFault::AfterVerification);
+                    }
                     if fault == ApplyFault::AfterVerification {
                         return Err(FsError::FaultInjected {
                             point: "after_verification",
@@ -310,6 +456,9 @@ impl ProposalStore {
                     }
                     record.state = State::Applied;
                     self.write_record(workspace, record)?;
+                    if let Some(hold) = hold {
+                        hold.park_at(ApplyFault::BeforeAudit);
+                    }
                     if fault == ApplyFault::BeforeAudit {
                         return Err(FsError::FaultInjected {
                             point: "before_audit",
@@ -517,11 +666,548 @@ impl ProposalStore {
         file.sync_all().map_err(|error| FsError::StoreUnavailable {
             message: error.to_string(),
         })?;
-        fs::write(&seq_path, next.to_string()).map_err(|error| FsError::StoreUnavailable {
+        let mut seq = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&seq_path)
+            .map_err(|error| FsError::StoreUnavailable {
+                message: error.to_string(),
+            })?;
+        write!(seq, "{next}").map_err(|error| FsError::StoreUnavailable {
+            message: error.to_string(),
+        })?;
+        seq.sync_all().map_err(|error| FsError::StoreUnavailable {
             message: error.to_string(),
         })?;
         Ok(())
     }
+
+    fn note_verified(
+        &self,
+        sandbox: &WorkspaceSandbox,
+        workspace: &WorkspaceIdentity,
+        record: &Record,
+        sealed: &RefCell<Option<Evidence>>,
+    ) -> Result<(), FsError> {
+        let mut sealed_evidence = sealed.borrow_mut();
+        let Some(evidence) = sealed_evidence.as_mut() else {
+            return Ok(());
+        };
+        evidence.phase = PHASE_VERIFIED;
+        evidence.verification = VERIFY_MATCH;
+        evidence.publication_complete = 1;
+        evidence.updated_at = unix_now();
+        if let Some(info) = target_info(sandbox, record) {
+            evidence.file_id_after = info.file_id();
+            if info.file_id() != record.target_file_id
+                || info.volume_serial() != record.target_volume
+            {
+                evidence.verification = VERIFY_MISMATCH;
+            }
+        }
+        self.write_evidence(workspace, evidence)
+    }
+
+    fn mark_recovery(&self, workspace: &WorkspaceIdentity, record: &Record) -> Result<(), FsError> {
+        let Some(mut evidence) = self.read_evidence(workspace, &record.id.to_string())? else {
+            return Ok(());
+        };
+        evidence.recovery = match record.state {
+            State::Applied => RECOVERY_APPLIED,
+            State::Failed => RECOVERY_FAILED,
+            State::Unclear => RECOVERY_UNCLEAR,
+            _ => RECOVERY_NONE,
+        };
+        evidence.updated_at = unix_now();
+        self.write_evidence(workspace, &evidence)
+    }
+
+    fn inspection(
+        &self,
+        sandbox: &WorkspaceSandbox,
+        workspace: &WorkspaceIdentity,
+        record: &Record,
+    ) -> ProposalInspection {
+        let observed = observe_target(sandbox, record);
+        let loaded = self.read_evidence(workspace, &record.id.to_string());
+        let (strategy, attempt, phase, stage, started, published, verification, recovery) =
+            match loaded {
+                Ok(Some(evidence)) => (
+                    "pinned_in_place".to_owned(),
+                    evidence.attempt_id.to_string(),
+                    evidence.phase_name().to_owned(),
+                    flag(evidence.stage_complete),
+                    flag(evidence.mutation_started),
+                    flag(evidence.publication_complete),
+                    evidence.verification_name().to_owned(),
+                    evidence.recovery_name().to_owned(),
+                ),
+                Ok(None) => absent_evidence(),
+                Err(_) => (
+                    "invalid".to_owned(),
+                    "invalid".to_owned(),
+                    "invalid".to_owned(),
+                    "invalid".to_owned(),
+                    "invalid".to_owned(),
+                    "invalid".to_owned(),
+                    "invalid".to_owned(),
+                    "invalid".to_owned(),
+                ),
+            };
+        ProposalInspection {
+            id: record.id.to_string(),
+            path: record.relative_path.clone(),
+            stored_state: record.state.as_str().to_owned(),
+            observed: observed.label.to_owned(),
+            original_hash: hex_encode(&record.original_hash),
+            proposed_hash: hex_encode(&record.proposed_hash),
+            current_hash: observed.current_hash,
+            recorded_file_id: hex_encode(&record.target_file_id),
+            current_file_id: observed.current_file_id,
+            strategy,
+            attempt_id: attempt,
+            evidence_phase: phase,
+            stage_complete: stage,
+            mutation_started: started,
+            publication_complete: published,
+            verification,
+            recovery,
+            conflict: observed.conflict.to_owned(),
+            next_step: next_step(record.state, observed.label).to_owned(),
+        }
+    }
+
+    fn evidence_path(&self, workspace: &WorkspaceIdentity, id: &str) -> PathBuf {
+        self.proposal_dir(workspace).join(format!("{id}.lcae"))
+    }
+
+    fn write_evidence(
+        &self,
+        workspace: &WorkspaceIdentity,
+        evidence: &Evidence,
+    ) -> Result<(), FsError> {
+        let dir = self.proposal_dir(workspace);
+        fs::create_dir_all(&dir).map_err(|error| FsError::StoreUnavailable {
+            message: error.to_string(),
+        })?;
+        let plaintext = evidence.encode()?;
+        let ciphertext =
+            lca_platform::protect(&plaintext).map_err(|_| FsError::StoreUnavailable {
+                message: "publication evidence could not be protected".to_owned(),
+            })?;
+        durable_bytes(
+            &self.evidence_path(workspace, &evidence.proposal_id.to_string()),
+            &ciphertext,
+        )
+    }
+
+    fn read_evidence(
+        &self,
+        workspace: &WorkspaceIdentity,
+        id: &str,
+    ) -> Result<Option<Evidence>, FsError> {
+        let path = self.evidence_path(workspace, id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let ciphertext = fs::read(&path).map_err(|_| FsError::StoreUnavailable {
+            message: "publication evidence could not be read".to_owned(),
+        })?;
+        let plaintext =
+            lca_platform::unprotect(&ciphertext).map_err(|_| FsError::StoreUnavailable {
+                message: "publication evidence protection check failed".to_owned(),
+            })?;
+        Ok(Some(Evidence::decode(&plaintext)?))
+    }
+}
+
+const STRATEGY_PINNED: u8 = 1;
+const PHASE_INTENT: u8 = 1;
+const PHASE_STAGED: u8 = 2;
+const PHASE_MUTATION: u8 = 3;
+const PHASE_PUBLISHED: u8 = 4;
+const PHASE_VERIFIED: u8 = 5;
+const VERIFY_UNKNOWN: u8 = 0;
+const VERIFY_MATCH: u8 = 1;
+const VERIFY_MISMATCH: u8 = 2;
+const RECOVERY_NONE: u8 = 0;
+const RECOVERY_APPLIED: u8 = 1;
+const RECOVERY_FAILED: u8 = 2;
+const RECOVERY_UNCLEAR: u8 = 3;
+
+struct Evidence {
+    proposal_id: Uuid,
+    digest: [u8; 32],
+    attempt_id: Uuid,
+    strategy: u8,
+    target_volume: u64,
+    file_id_before: [u8; 16],
+    file_id_after: [u8; 16],
+    original_hash: [u8; 32],
+    proposed_hash: [u8; 32],
+    original: Vec<u8>,
+    phase: u8,
+    stage_complete: u8,
+    mutation_started: u8,
+    publication_complete: u8,
+    verification: u8,
+    recovery: u8,
+    sealed_at: u64,
+    updated_at: u64,
+}
+
+impl Evidence {
+    fn intent(record: &Record, original: &[u8]) -> Self {
+        let now = unix_now();
+        Self {
+            proposal_id: record.id,
+            digest: record.digest,
+            attempt_id: Uuid::new_v4(),
+            strategy: STRATEGY_PINNED,
+            target_volume: record.target_volume,
+            file_id_before: record.target_file_id,
+            file_id_after: [0; 16],
+            original_hash: record.original_hash,
+            proposed_hash: record.proposed_hash,
+            original: original.to_vec(),
+            phase: PHASE_INTENT,
+            stage_complete: 0,
+            mutation_started: 0,
+            publication_complete: 0,
+            verification: VERIFY_UNKNOWN,
+            recovery: RECOVERY_NONE,
+            sealed_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn observe(&mut self, event: &str) {
+        match event {
+            "stage_flushed" => {
+                self.phase = PHASE_STAGED;
+                self.stage_complete = 1;
+            }
+            "mutation_started" => {
+                self.phase = PHASE_MUTATION;
+                self.mutation_started = 1;
+            }
+            "mutation_published" => {
+                self.phase = PHASE_PUBLISHED;
+                self.publication_complete = 1;
+            }
+            "verification_failed" => {
+                self.verification = VERIFY_MISMATCH;
+            }
+            _ => {}
+        }
+        self.updated_at = unix_now();
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self.phase {
+            PHASE_INTENT => "intent",
+            PHASE_STAGED => "staged",
+            PHASE_MUTATION => "mutation_started",
+            PHASE_PUBLISHED => "published",
+            PHASE_VERIFIED => "verified",
+            _ => "unknown",
+        }
+    }
+
+    fn verification_name(&self) -> &'static str {
+        match self.verification {
+            VERIFY_MATCH => "match",
+            VERIFY_MISMATCH => "mismatch",
+            _ => "unknown",
+        }
+    }
+
+    fn recovery_name(&self) -> &'static str {
+        match self.recovery {
+            RECOVERY_APPLIED => "applied",
+            RECOVERY_FAILED => "failed",
+            RECOVERY_UNCLEAR => "unclear",
+            _ => "none",
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, FsError> {
+        if sha256(&self.original) != self.original_hash {
+            return Err(FsError::StoreUnavailable {
+                message: "publication evidence does not match the original hash".to_owned(),
+            });
+        }
+        let mut body = Vec::new();
+        push_part(&mut body, b"LCA-01I-EVIDENCE-V1");
+        push_part(&mut body, self.proposal_id.as_bytes());
+        push_part(&mut body, &self.digest);
+        push_part(&mut body, self.attempt_id.as_bytes());
+        push_part(&mut body, &[self.strategy]);
+        push_part(&mut body, &self.target_volume.to_le_bytes());
+        push_part(&mut body, &self.file_id_before);
+        push_part(&mut body, &self.file_id_after);
+        push_part(&mut body, &self.original_hash);
+        push_part(&mut body, &self.proposed_hash);
+        push_part(&mut body, &self.original);
+        push_part(&mut body, &[self.phase]);
+        push_part(&mut body, &[self.stage_complete]);
+        push_part(&mut body, &[self.mutation_started]);
+        push_part(&mut body, &[self.publication_complete]);
+        push_part(&mut body, &[self.verification]);
+        push_part(&mut body, &[self.recovery]);
+        push_part(&mut body, &self.sealed_at.to_le_bytes());
+        push_part(&mut body, &self.updated_at.to_le_bytes());
+        let digest = sha256(&body);
+        body.extend_from_slice(&digest);
+        Ok(body)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, FsError> {
+        if bytes.len() < 32 {
+            return Err(FsError::StoreUnavailable {
+                message: "publication evidence is truncated".to_owned(),
+            });
+        }
+        let (body, tail) = bytes.split_at(bytes.len() - 32);
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(tail);
+        if sha256(body) != expected {
+            return Err(FsError::StoreUnavailable {
+                message: "publication evidence digest does not match".to_owned(),
+            });
+        }
+        let mut cursor = body;
+        let label = read_part(&mut cursor, 64)?;
+        if label != b"LCA-01I-EVIDENCE-V1" {
+            return Err(FsError::StoreUnavailable {
+                message: "publication evidence label is not recognized".to_owned(),
+            });
+        }
+        let proposal_id = Uuid::from_bytes(read_array::<16>(&mut cursor)?);
+        let digest = read_array::<32>(&mut cursor)?;
+        let attempt_id = Uuid::from_bytes(read_array::<16>(&mut cursor)?);
+        let strategy = read_byte(&mut cursor)?;
+        if strategy != STRATEGY_PINNED {
+            return Err(FsError::StoreUnavailable {
+                message: "publication strategy is not recognized".to_owned(),
+            });
+        }
+        let target_volume = read_u64(&mut cursor)?;
+        let file_id_before = read_array::<16>(&mut cursor)?;
+        let file_id_after = read_array::<16>(&mut cursor)?;
+        let original_hash = read_array::<32>(&mut cursor)?;
+        let proposed_hash = read_array::<32>(&mut cursor)?;
+        let original = read_part(&mut cursor, MAX_PROPOSED)?.to_vec();
+        let phase = read_byte(&mut cursor)?;
+        let stage_complete = read_byte(&mut cursor)?;
+        let mutation_started = read_byte(&mut cursor)?;
+        let publication_complete = read_byte(&mut cursor)?;
+        let verification = read_byte(&mut cursor)?;
+        let recovery = read_byte(&mut cursor)?;
+        let sealed_at = read_u64(&mut cursor)?;
+        let updated_at = read_u64(&mut cursor)?;
+        if !cursor.is_empty() {
+            return Err(FsError::StoreUnavailable {
+                message: "publication evidence has trailing bytes".to_owned(),
+            });
+        }
+        if sha256(&original) != original_hash {
+            return Err(FsError::StoreUnavailable {
+                message: "publication evidence does not match the original hash".to_owned(),
+            });
+        }
+        Ok(Self {
+            proposal_id,
+            digest,
+            attempt_id,
+            strategy,
+            target_volume,
+            file_id_before,
+            file_id_after,
+            original_hash,
+            proposed_hash,
+            original,
+            phase,
+            stage_complete,
+            mutation_started,
+            publication_complete,
+            verification,
+            recovery,
+            sealed_at,
+            updated_at,
+        })
+    }
+}
+
+struct Observation {
+    label: &'static str,
+    current_hash: String,
+    current_file_id: String,
+    conflict: &'static str,
+}
+
+fn observe_target(sandbox: &WorkspaceSandbox, record: &Record) -> Observation {
+    let Some(info) = target_info(sandbox, record) else {
+        return Observation {
+            label: "unreadable",
+            current_hash: "unreadable".to_owned(),
+            current_file_id: "unreadable".to_owned(),
+            conflict: "target could not be opened",
+        };
+    };
+    if info.is_reparse()
+        || info.is_directory()
+        || info.link_count() != 1
+        || info.file_id() == [0; 16]
+    {
+        return Observation {
+            label: "unreadable",
+            current_hash: "unreadable".to_owned(),
+            current_file_id: hex_encode(&info.file_id()),
+            conflict: "target is not a single regular file",
+        };
+    }
+    let bytes = match sandbox.read_bytes(&record.relative_path, MAX_PROPOSED as u64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Observation {
+                label: "unreadable",
+                current_hash: "unreadable".to_owned(),
+                current_file_id: hex_encode(&info.file_id()),
+                conflict: "target bytes could not be read",
+            };
+        }
+    };
+    let hash = sha256(&bytes);
+    let same =
+        info.file_id() == record.target_file_id && info.volume_serial() == record.target_volume;
+    let current_hash = hex_encode(&hash);
+    let current_file_id = hex_encode(&info.file_id());
+    if !same {
+        return Observation {
+            label: "identity_differs",
+            current_hash,
+            current_file_id,
+            conflict: "target file id does not match the approved object",
+        };
+    }
+    if hash == record.proposed_hash {
+        Observation {
+            label: "matches_proposed",
+            current_hash,
+            current_file_id,
+            conflict: "none",
+        }
+    } else if hash == record.original_hash {
+        Observation {
+            label: "matches_original",
+            current_hash,
+            current_file_id,
+            conflict: "none",
+        }
+    } else {
+        Observation {
+            label: "matches_neither",
+            current_hash,
+            current_file_id,
+            conflict: "target bytes match neither the original nor the proposed hash",
+        }
+    }
+}
+
+fn target_info(sandbox: &WorkspaceSandbox, record: &Record) -> Option<lca_platform::ObjectInfo> {
+    let components: Vec<String> = record
+        .relative_path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect();
+    lca_platform::stat_tree(sandbox.root(), &components).ok()
+}
+
+fn next_step(_state: State, observed: &str) -> &'static str {
+    match observed {
+        "matches_proposed" => {
+            "the proposed bytes are on the approved file id; do not apply this approval again"
+        }
+        "matches_original" => {
+            "the original bytes are still on the approved file id; a new proposal and a new approval are required before another write"
+        }
+        "matches_neither" => {
+            "the file matches neither hash; the sealed preimage is in the proposal store; restoring it requires a new proposal and a new approval"
+        }
+        "identity_differs" => {
+            "the open file id is not the approved object; this approval will not be reused"
+        }
+        _ => "the target could not be classified; no write was performed",
+    }
+}
+
+fn absent_evidence() -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+) {
+    (
+        "absent".to_owned(),
+        "absent".to_owned(),
+        "absent".to_owned(),
+        "absent".to_owned(),
+        "absent".to_owned(),
+        "absent".to_owned(),
+        "absent".to_owned(),
+        "absent".to_owned(),
+    )
+}
+
+fn flag(value: u8) -> String {
+    if value == 0 {
+        "false".to_owned()
+    } else {
+        "true".to_owned()
+    }
+}
+
+fn read_byte(input: &mut &[u8]) -> Result<u8, FsError> {
+    let bytes = read_part(input, 8)?;
+    if bytes.len() != 1 {
+        return Err(FsError::StoreUnavailable {
+            message: "publication evidence field is invalid".to_owned(),
+        });
+    }
+    Ok(bytes[0])
+}
+
+fn durable_bytes(path: &Path, bytes: &[u8]) -> Result<(), FsError> {
+    let mut partial_name = path.as_os_str().to_owned();
+    partial_name.push(".partial");
+    let partial = PathBuf::from(partial_name);
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&partial)
+            .map_err(|error| FsError::StoreUnavailable {
+                message: error.to_string(),
+            })?;
+        file.write_all(bytes)
+            .map_err(|error| FsError::StoreUnavailable {
+                message: error.to_string(),
+            })?;
+        file.sync_all().map_err(|error| FsError::StoreUnavailable {
+            message: error.to_string(),
+        })?;
+    }
+    fs::rename(&partial, path).map_err(|error| FsError::StoreUnavailable {
+        message: error.to_string(),
+    })
 }
 
 struct WorkspaceIdentity {
@@ -1233,6 +1919,16 @@ mod tests {
             fs::read(root_ok.join("notes.txt")).expect("stable"),
             b"beta\n"
         );
+        let report = store.inspect(&sandbox_ok, &saved_ok.id).expect("inspect");
+        assert_eq!(report.stored_state, "applied");
+        assert_eq!(report.observed, "matches_proposed");
+        assert_eq!(report.strategy, "pinned_in_place");
+        assert_eq!(report.verification, "match");
+        assert_eq!(report.current_file_id, report.recorded_file_id);
+        assert_eq!(
+            fs::read(root_ok.join("notes.txt")).expect("inspect does not write"),
+            b"beta\n"
+        );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(root_ok);
         let _ = fs::remove_dir_all(state);
@@ -1300,9 +1996,12 @@ mod tests {
         let points = [
             ApplyFault::AfterValidation,
             ApplyFault::AfterApproval,
+            ApplyFault::AfterIntent,
             ApplyFault::AfterTempCreate,
             ApplyFault::AfterWrite,
+            ApplyFault::AfterStageFlush,
             ApplyFault::BeforeRename,
+            ApplyFault::DuringPublish,
             ApplyFault::AfterRename,
             ApplyFault::BeforeReadback,
             ApplyFault::DuringReadback,
@@ -1351,7 +2050,42 @@ mod tests {
                         "approved"
                     );
                 }
-                ApplyFault::AfterTempCreate | ApplyFault::AfterWrite | ApplyFault::BeforeRename => {
+                ApplyFault::BeforeRename => {
+                    assert_eq!(bytes, b"alpha\n");
+                    assert_eq!(
+                        store.status(&sandbox, &saved.id).expect("status").state,
+                        "failed",
+                        "{fault:?} {error}"
+                    );
+                }
+                ApplyFault::DuringPublish => {
+                    assert_ne!(bytes, b"alpha\n", "{fault:?}");
+                    assert_ne!(bytes, b"beta\n", "{fault:?}");
+                    assert!(log_before.contains("state_unclear"), "{log_before}");
+                    let status = store.status(&sandbox, &saved.id).expect("status");
+                    assert_eq!(status.state, "unclear");
+                    assert_eq!(fs::read(root.join("notes.txt")).expect("stable"), bytes);
+                    let report = store.inspect(&sandbox, &saved.id).expect("inspect");
+                    assert_eq!(report.observed, "matches_neither");
+                    assert_eq!(report.strategy, "pinned_in_place");
+                    let again = store.approve(
+                        &sandbox,
+                        &limits(),
+                        &saved.id,
+                        &view.digest,
+                        &view.confirmation,
+                    );
+                    assert!(again.is_err(), "a torn publish must not be retried");
+                    assert_eq!(fs::read(root.join("notes.txt")).expect("untouched"), bytes);
+                    let recovered = store.recover(&sandbox, &saved.id).expect("recover");
+                    assert_eq!(recovered.stored_state, "unclear");
+                    assert_eq!(recovered.recovery, "unclear");
+                    assert_eq!(fs::read(root.join("notes.txt")).expect("still"), bytes);
+                }
+                ApplyFault::AfterTempCreate
+                | ApplyFault::AfterWrite
+                | ApplyFault::AfterStageFlush
+                | ApplyFault::AfterIntent => {
                     assert_eq!(bytes, b"alpha\n");
                     assert_eq!(
                         store.status(&sandbox, &saved.id).expect("status").state,

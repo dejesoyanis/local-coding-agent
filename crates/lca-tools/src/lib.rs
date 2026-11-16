@@ -34,11 +34,11 @@ pub use error::{DenyReason, ToolError};
 pub use executor::{RejectingToolExecutor, ToolExecutor};
 pub use fs::{
     ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, DirectoryEntry, FsLimitValues,
-    FsLimits, FsOutcome, ListResult, PreparedPatch, ReadResult, SearchMatch, SearchResult,
-    apply_granted, execute_validated,
+    FsLimits, FsOutcome, KillHold, ListResult, PreparedPatch, ReadResult, SearchMatch,
+    SearchResult, apply_granted, execute_validated,
 };
 pub use fs_error::FsError;
 pub use model::{ToolArguments, ToolName, ToolRequest, ToolResult};
 pub use privacy::{PrivacyPatternError, PrivacyPolicy, deny_overrides};
-pub use proposal::{ProposalStore, ProposalSummary, ProposalView};
+pub use proposal::{ProposalInspection, ProposalStore, ProposalSummary, ProposalView};
 pub use sandbox::{ResolvedKind, ResolvedPath, WorkspaceSandbox};

@@ -155,16 +155,21 @@ impl OpenedTarget {
 /// Points where a publish can be observed or faulted.
 ///
 /// `BeforeRename` is the last point before the verified handle changes.
+/// `DuringPublish` is after the first `WriteFile` transfer and before `SetEndOfFile`.
 /// `AfterRename` is the first point after those bytes have been flushed.
 /// The names match the fault model. The implementation does not rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishPhase {
     /// The temporary file exists and has not been written.
     AfterTempCreate,
-    /// The temporary file contains the full byte image.
+    /// The temporary file contains the byte image. It may not have been flushed.
     AfterWrite,
+    /// The temporary file was flushed and its read-back matched.
+    AfterStageFlush,
     /// The target handle is about to be overwritten.
     BeforeRename,
+    /// At least one `WriteFile` to the target has returned. The file may be partial.
+    DuringPublish,
     /// The target handle has the new bytes and they have been flushed.
     AfterRename,
     /// The handle is about to be read back.

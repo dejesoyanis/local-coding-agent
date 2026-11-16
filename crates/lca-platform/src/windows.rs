@@ -45,6 +45,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 use crate::{ObjectInfo, PlatformError, PublishFailure, PublishPhase};
 
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfoEx, ReplaceFileW};
+
 const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const FILE_LIST_DIRECTORY: u32 = 0x0001;
 const FILE_ADD_FILE: u32 = 0x0002;
@@ -128,8 +131,15 @@ impl OpenedTarget {
             dispose_handle(temp.raw());
             return Err(clean(error));
         }
-        let staged = write_handle(temp.raw(), bytes)
-            .and_then(|()| flush_handle(temp.raw()))
+        if let Err(error) = write_handle(temp.raw(), bytes) {
+            dispose_handle(temp.raw());
+            return Err(clean(error));
+        }
+        if let Err(error) = hook(PublishPhase::AfterWrite) {
+            dispose_handle(temp.raw());
+            return Err(clean(error));
+        }
+        let staged = flush_handle(temp.raw())
             .and_then(|()| read_handle(temp.raw(), (bytes.len() as u64).saturating_add(1)))
             .and_then(|readback| {
                 if readback == bytes {
@@ -142,7 +152,7 @@ impl OpenedTarget {
             dispose_handle(temp.raw());
             return Err(clean(error));
         }
-        if let Err(error) = hook(PublishPhase::AfterWrite) {
+        if let Err(error) = hook(PublishPhase::AfterStageFlush) {
             dispose_handle(temp.raw());
             return Err(clean(error));
         }
@@ -166,7 +176,10 @@ impl OpenedTarget {
             return Err(clean(error));
         }
         dispose_handle(temp.raw());
-        if let Err(error) = publish_handle(self.file.raw(), bytes) {
+        // Publication stays on this handle. A rename would require share-delete, and that
+        // share lets another caller move the directory entry first. Measured in
+        // `measured_windows_publication_options`.
+        if let Err(error) = publish_handle(self.file.raw(), bytes, hook) {
             return Err(published(error));
         }
         if let Err(error) = hook(PublishPhase::AfterRename) {
@@ -738,9 +751,38 @@ fn create_temp(parent: HANDLE) -> Result<OwnedHandle, PlatformError> {
     Err(last)
 }
 
-fn publish_handle(handle: HANDLE, bytes: &[u8]) -> Result<(), PlatformError> {
+fn publish_handle(
+    handle: HANDLE,
+    bytes: &[u8],
+    hook: &mut dyn FnMut(PublishPhase) -> Result<(), PlatformError>,
+) -> Result<(), PlatformError> {
     rewind(handle)?;
-    write_handle(handle, bytes)?;
+    let mut offset = 0usize;
+    let mut signaled = false;
+    while offset < bytes.len() {
+        let chunk = (bytes.len() - offset).min(64 * 1024);
+        let mut written = 0u32;
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                bytes[offset..].as_ptr().cast(),
+                chunk as u32,
+                &mut written,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || written == 0 {
+            return Err(io_code());
+        }
+        offset += written as usize;
+        if !signaled {
+            signaled = true;
+            hook(PublishPhase::DuringPublish)?;
+        }
+    }
+    if !signaled {
+        hook(PublishPhase::DuringPublish)?;
+    }
     let end = i64::try_from(bytes.len())
         .map_err(|_| PlatformError::Io("file is too large".to_owned()))?;
     let moved = unsafe { SetFilePointerEx(handle, end, ptr::null_mut(), 0) };
@@ -1323,4 +1365,366 @@ struct AceHeader {
     ace_type: u8,
     ace_flags: u8,
     ace_size: u16,
+}
+
+#[cfg(test)]
+fn posix_replace(staged: HANDLE, parent: HANDLE, name: &str) -> Result<(), String> {
+    let mut notes = Vec::new();
+    let relative = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    let mut forms = vec![(parent, relative.to_owned())];
+    if name.contains(['\\', '/']) {
+        forms.push((ptr::null_mut(), name.to_owned()));
+        forms.push((ptr::null_mut(), format!(r"\\?\{name}")));
+    }
+    for (root, form) in forms {
+        for null_terminated in [false, true] {
+            let mut wide: Vec<u16> = form.encode_utf16().collect();
+            let chars = wide.len();
+            if null_terminated {
+                wide.push(0);
+            }
+            let name_at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+            let root_at = std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory);
+            let len_at = std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength);
+            let mut buffer = vec![0u8; name_at + wide.len() * 2 + 8];
+            buffer[..4].copy_from_slice(&0x3u32.to_le_bytes());
+            let root_bytes = (root as usize).to_le_bytes();
+            let root_len = std::mem::size_of::<HANDLE>();
+            buffer[root_at..root_at + root_len].copy_from_slice(&root_bytes[..root_len]);
+            let nbytes = u32::try_from(chars * 2).unwrap_or(0);
+            buffer[len_at..len_at + 4].copy_from_slice(&nbytes.to_le_bytes());
+            for (index, unit) in wide.iter().enumerate() {
+                let at = name_at + index * 2;
+                buffer[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            let win32 = unsafe {
+                SetFileInformationByHandle(
+                    staged,
+                    FileRenameInfoEx,
+                    buffer.as_ptr().cast(),
+                    u32::try_from(name_at + wide.len() * 2).unwrap_or(0),
+                )
+            };
+            if win32 != 0 {
+                return Ok(());
+            }
+            let win32_error = unsafe { GetLastError() };
+            let mut io = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
+            let status = unsafe {
+                windows_sys::Wdk::Storage::FileSystem::NtSetInformationFile(
+                    staged,
+                    io.as_mut_ptr(),
+                    buffer.as_ptr().cast(),
+                    u32::try_from(name_at + wide.len() * 2).unwrap_or(0),
+                    windows_sys::Wdk::Storage::FileSystem::FileRenameInformationEx,
+                )
+            };
+            notes.push(format!(
+                "root_null={} null={} name={form:?} win32={win32_error} nt={status:#x} name_at={name_at} root_at={root_at}",
+                root.is_null(),
+                null_terminated,
+            ));
+            if status >= 0 {
+                return Ok(());
+            }
+        }
+    }
+    Err(notes.join(" | "))
+}
+
+#[cfg(test)]
+fn probe_dir(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("lca-pub-{label}-{nanos}"));
+    std::fs::create_dir_all(&path).expect("probe dir");
+    path
+}
+
+/// Measured publication facts for LCA-01I. These asserts are the evidence, not the names of the APIs.
+#[cfg(test)]
+#[test]
+fn measured_windows_publication_options() {
+    let root = probe_dir("measure");
+    let parent = open_root(&root).expect("parent");
+
+    std::fs::write(root.join("held.txt"), b"alpha\n").expect("seed");
+    let exclusive = open_named(
+        parent.raw(),
+        "held.txt",
+        FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+    )
+    .expect("exclusive");
+    let staged_blocked = open_named(
+        parent.raw(),
+        "staged-blocked.txt",
+        DELETE | FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_CREATE,
+    )
+    .expect("staged");
+    write_handle(staged_blocked.raw(), b"beta\n").expect("stage");
+    flush_handle(staged_blocked.raw()).expect("flush");
+    let blocked = posix_replace(
+        staged_blocked.raw(),
+        parent.raw(),
+        &root.join("held.txt").to_string_lossy(),
+    );
+    let blocked = blocked.expect_err("posix replace must fail while share-delete is denied");
+    let blocked_lower = blocked.to_ascii_lowercase();
+    assert!(
+        blocked_lower.contains("32")
+            || blocked_lower.contains("c0000043")
+            || blocked_lower.contains("c0000022"),
+        "exclusive handle did not fail with a sharing status: {blocked}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("held.txt")).expect("bytes"),
+        b"alpha\n"
+    );
+    let before = query_handle(exclusive.raw()).expect("id");
+    assert_eq!(
+        query_handle(exclusive.raw()).expect("same").file_id,
+        before.file_id
+    );
+    drop(exclusive);
+    drop(staged_blocked);
+
+    std::fs::write(root.join("shared.txt"), b"alpha\n").expect("shared seed");
+    let shared = open_named(
+        parent.raw(),
+        "shared.txt",
+        FILE_GENERIC_READ | FILE_WRITE_DATA | DELETE | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .expect("shared");
+    let _shared_id = query_handle(shared.raw()).expect("shared id").file_id;
+    let away = root.join("away.txt");
+    let renamed = std::fs::rename(root.join("shared.txt"), &away);
+    assert!(
+        renamed.is_ok(),
+        "share-delete lets another rename move the verified name: {renamed:?}"
+    );
+    assert_eq!(std::fs::read(&away).expect("moved"), b"alpha\n");
+    drop(shared);
+    let _ = std::fs::remove_file(&away);
+
+    std::fs::write(root.join("target.txt"), b"alpha\n").expect("target");
+    let pinned = open_named(
+        parent.raw(),
+        "target.txt",
+        FILE_GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .expect("pinned");
+    let old_id = query_handle(pinned.raw()).expect("old").file_id;
+    let staged = open_named(
+        parent.raw(),
+        "staged.txt",
+        DELETE | FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_CREATE,
+    )
+    .expect("staged ok");
+    let staged_id = query_handle(staged.raw()).expect("staged id").file_id;
+    write_handle(staged.raw(), b"beta\n").expect("beta");
+    flush_handle(staged.raw()).expect("flush beta");
+    let replaced = posix_replace(
+        staged.raw(),
+        parent.raw(),
+        &root.join("target.txt").to_string_lossy(),
+    );
+    assert!(replaced.is_ok(), "posix replace failed: {replaced:?}");
+    let pending = query_handle(pinned.raw()).expect("pending");
+    assert_eq!(pending.file_id, old_id);
+    assert_eq!(
+        read_handle(pinned.raw(), 64).expect("old bytes"),
+        b"alpha\n"
+    );
+    assert_eq!(pending.end_of_file, 6);
+    let standard_pending = {
+        let mut standard = FILE_STANDARD_INFO {
+            AllocationSize: 0,
+            EndOfFile: 0,
+            NumberOfLinks: 0,
+            DeletePending: 0,
+            Directory: 0,
+        };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                pinned.raw(),
+                FileStandardInfo,
+                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                u32::try_from(std::mem::size_of::<FILE_STANDARD_INFO>()).unwrap_or(0),
+            )
+        };
+        assert_ne!(ok, 0);
+        standard.DeletePending
+    };
+    assert_eq!(
+        standard_pending, 1,
+        "replaced handle must be delete-pending"
+    );
+    drop(pinned);
+    drop(staged);
+    let reopened = open_named(
+        parent.raw(),
+        "target.txt",
+        FILE_GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .expect("reopen2");
+    let now = query_handle(reopened.raw()).expect("now");
+    assert_eq!(now.file_id, staged_id);
+    assert_ne!(now.file_id, old_id);
+    assert_eq!(read_handle(reopened.raw(), 64).expect("new"), b"beta\n");
+    drop(reopened);
+
+    std::fs::write(root.join("locked.txt"), b"alpha\n").expect("locked");
+    let locked = open_named(
+        parent.raw(),
+        "locked.txt",
+        FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .expect("lock open");
+    let mut overlapped = windows_sys::Win32::System::IO::OVERLAPPED {
+        Internal: 0,
+        InternalHigh: 0,
+        Anonymous: windows_sys::Win32::System::IO::OVERLAPPED_0 {
+            Anonymous: windows_sys::Win32::System::IO::OVERLAPPED_0_0 {
+                Offset: 0,
+                OffsetHigh: 0,
+            },
+        },
+        hEvent: ptr::null_mut(),
+    };
+    let lock_ok = unsafe {
+        LockFileEx(
+            locked.raw(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    assert_ne!(lock_ok, 0, "byte lock failed {}", unsafe { GetLastError() });
+    let lock_rename = std::fs::rename(root.join("locked.txt"), root.join("locked-away.txt"));
+    assert!(
+        lock_rename.is_ok(),
+        "measured fact: an exclusive byte-range lock does not pin the directory entry when delete is shared: {lock_rename:?}"
+    );
+    drop(locked);
+
+    std::fs::write(root.join("replace-held.txt"), b"alpha\n").expect("rf held");
+    std::fs::write(root.join("replace-new.txt"), b"beta\n").expect("rf new");
+    let held = open_named(
+        parent.raw(),
+        "replace-held.txt",
+        FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+    )
+    .expect("rf exclusive");
+    let held_wide = wide_path(&root.join("replace-held.txt")).expect("wide");
+    let new_wide = wide_path(&root.join("replace-new.txt")).expect("wide");
+    let replace_held = unsafe {
+        ReplaceFileW(
+            held_wide.as_ptr(),
+            new_wide.as_ptr(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert_eq!(
+        replace_held, 0,
+        "ReplaceFile must fail against an exclusive handle"
+    );
+    drop(held);
+
+    std::fs::write(root.join("replace-old.txt"), b"alpha\n").expect("old");
+    std::fs::write(root.join("replace-src.txt"), b"beta\n").expect("src");
+    let src = open_named(
+        parent.raw(),
+        "replace-src.txt",
+        FILE_GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .expect("src id");
+    let src_id = query_handle(src.raw()).expect("src").file_id;
+    drop(src);
+    let old = open_named(
+        parent.raw(),
+        "replace-old.txt",
+        FILE_GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .expect("old id");
+    let old_replace_id = query_handle(old.raw()).expect("old").file_id;
+    drop(old);
+    let old_wide = wide_path(&root.join("replace-old.txt")).expect("wide");
+    let src_wide = wide_path(&root.join("replace-src.txt")).expect("wide");
+    let backup = root.join("replace-backup.txt");
+    let backup_wide = wide_path(&backup).expect("wide");
+    let replace_ok = unsafe {
+        ReplaceFileW(
+            old_wide.as_ptr(),
+            src_wide.as_ptr(),
+            backup_wide.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert_ne!(replace_ok, 0, "ReplaceFile failed {}", unsafe {
+        GetLastError()
+    });
+    let result = open_named(
+        parent.raw(),
+        "replace-old.txt",
+        FILE_GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+    )
+    .expect("result");
+    let result_id = query_handle(result.raw()).expect("result id").file_id;
+    assert_eq!(result_id, src_id);
+    assert_ne!(result_id, old_replace_id);
+    assert_eq!(read_handle(result.raw(), 64).expect("rf bytes"), b"beta\n");
+    assert_eq!(std::fs::read(&backup).expect("backup"), b"alpha\n");
+    drop(result);
+    drop(parent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(test)]
+fn open_named(
+    parent: HANDLE,
+    name: &str,
+    access: u32,
+    share: u32,
+    disposition: u32,
+) -> Result<OwnedHandle, PlatformError> {
+    let wide = wide_component(name)?;
+    create_child(
+        parent,
+        &wide,
+        access,
+        share,
+        disposition,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
 }

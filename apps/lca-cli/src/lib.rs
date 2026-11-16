@@ -168,6 +168,12 @@ where
             ProposalCli::Reject { id } => {
                 Invocation::Buffered(patch_cmd::run_reject(&config_path, &id))
             }
+            ProposalCli::Inspect { id } => {
+                Invocation::Buffered(patch_cmd::run_inspect(&config_path, &id))
+            }
+            ProposalCli::Recover { id } => {
+                Invocation::Buffered(patch_cmd::run_recover(&config_path, &id))
+            }
             ProposalCli::Approve { id } => {
                 Invocation::ProposalApprove(patch_cmd::ProposalApproveCommand {
                     config: config_path,
@@ -375,6 +381,16 @@ enum ProposalCli {
     },
     /// Mark one prepared proposal rejected.
     Reject {
+        /// Proposal UUID.
+        id: String,
+    },
+    /// Show publication evidence. This does not write the proposal or the target.
+    Inspect {
+        /// Proposal UUID.
+        id: String,
+    },
+    /// Reconcile one proposal from the target bytes. This does not write the target.
+    Recover {
         /// Proposal UUID.
         id: String,
     },

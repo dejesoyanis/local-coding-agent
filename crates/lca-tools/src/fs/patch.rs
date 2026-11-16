@@ -299,12 +299,18 @@ pub enum ApplyFault {
     AfterValidation,
     /// After approval is stored, before the apply starts.
     AfterApproval,
+    /// After the original bytes are sealed and before the target is staged.
+    AfterIntent,
     /// After the temporary file is created.
     AfterTempCreate,
-    /// After the temporary file holds the full byte image.
+    /// After the temporary file holds the byte image, before it is flushed.
     AfterWrite,
+    /// After the temporary file was flushed and read back.
+    AfterStageFlush,
     /// Immediately before the verified handle is overwritten.
     BeforeRename,
+    /// After the first target `WriteFile` and before the file length is adjusted.
+    DuringPublish,
     /// Immediately after the verified handle has been flushed.
     AfterRename,
     /// Before the handle is read back.
@@ -329,15 +335,75 @@ impl ApplyFault {
             Self::None => return None,
             Self::AfterValidation => "after_validation",
             Self::AfterApproval => "after_approval",
+            Self::AfterIntent => "after_intent",
             Self::AfterTempCreate => "after_temp_create",
             Self::AfterWrite => "after_write",
+            Self::AfterStageFlush => "after_stage_flush",
             Self::BeforeRename => "before_rename",
+            Self::DuringPublish => "during_publish",
             Self::AfterRename => "after_rename",
             Self::BeforeReadback => "before_readback",
             Self::DuringReadback => "during_readback",
             Self::AfterVerification => "after_verification",
             Self::BeforeAudit => "before_audit",
         })
+    }
+
+    /// Parses a test-harness point name. Production code does not call this.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "after_validation" => Self::AfterValidation,
+            "after_approval" => Self::AfterApproval,
+            "after_intent" => Self::AfterIntent,
+            "after_temp_create" => Self::AfterTempCreate,
+            "after_write" => Self::AfterWrite,
+            "after_stage_flush" => Self::AfterStageFlush,
+            "before_rename" => Self::BeforeRename,
+            "during_publish" => Self::DuringPublish,
+            "after_rename" => Self::AfterRename,
+            "before_readback" => Self::BeforeReadback,
+            "during_readback" => Self::DuringReadback,
+            "after_verification" => Self::AfterVerification,
+            "before_audit" => Self::BeforeAudit,
+            _ => return None,
+        })
+    }
+}
+
+/// Parks the calling thread at one fault point after writing `ready`.
+///
+/// The `lca` binary does not construct this. A test process writes the ready file and
+/// then waits to be killed. There is no environment variable that arms it.
+#[derive(Debug)]
+pub struct KillHold {
+    point: ApplyFault,
+    ready: PathBuf,
+}
+
+impl KillHold {
+    /// Holds at `point` and creates `ready` when that point is reached.
+    #[must_use]
+    pub fn new(point: ApplyFault, ready: PathBuf) -> Self {
+        Self { point, ready }
+    }
+
+    pub(crate) fn park_at(&self, point: ApplyFault) {
+        if self.point != point {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.ready)
+        {
+            use std::io::Write;
+            let name = point.phase_name().unwrap_or("hold");
+            let _ = file.write_all(name.as_bytes());
+            let _ = file.sync_all();
+        }
+        std::thread::park();
     }
 }
 
@@ -353,16 +419,21 @@ pub(crate) fn apply_granted(
         grant,
         ledger,
         ApplyFault::None,
+        None,
+        &mut |_| Ok(()),
         &mut |_| Ok(()),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_granted_controlled(
     sandbox: &WorkspaceSandbox,
     prepared: &PreparedPatch,
     grant: ApprovalGrant,
     ledger: &ApprovalLedger,
     fault: ApplyFault,
+    hold: Option<&KillHold>,
+    preimage: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
     audit: &mut dyn FnMut(&str) -> Result<(), FsError>,
 ) -> Result<ApplyResult, FsError> {
     if grant.action_id != prepared.action_id || grant.binding != prepared.binding {
@@ -409,7 +480,7 @@ pub(crate) fn apply_granted_controlled(
 
     #[cfg(windows)]
     {
-        apply_ntfs(prepared, &mut used, fault, audit)?;
+        apply_ntfs(prepared, &mut used, fault, hold, preimage, audit)?;
         Ok(ApplyResult {
             path: prepared.relative_path.clone(),
             new_hash: hex_encode(&prepared.new_hash),
@@ -418,6 +489,7 @@ pub(crate) fn apply_granted_controlled(
     #[cfg(not(windows))]
     {
         refuse_armed_fault(fault)?;
+        let _ = (hold, preimage);
         let _ = audit;
         let parent = resolved
             .absolute()
@@ -993,6 +1065,8 @@ fn apply_ntfs(
     prepared: &PreparedPatch,
     used: &mut std::collections::HashSet<[u8; 32]>,
     fault: ApplyFault,
+    hold: Option<&KillHold>,
+    preimage: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
     audit: &mut dyn FnMut(&str) -> Result<(), FsError>,
 ) -> Result<(), FsError> {
     if prepared.platform.file_id == [0; 16] {
@@ -1034,11 +1108,28 @@ fn apply_ntfs(
             path: prepared.relative_path.clone(),
         });
     }
+    preimage(&current)?;
+    if fault == ApplyFault::AfterIntent {
+        return Err(FsError::FaultInjected {
+            point: "after_intent",
+            published: false,
+        });
+    }
+    if let Some(hold) = hold {
+        hold.park_at(ApplyFault::AfterIntent);
+    }
     used.insert(prepared.binding);
     let mut injected = None;
     let mut audit_error = None;
     let mut hook = |phase: lca_platform::PublishPhase| -> Result<(), lca_platform::PlatformError> {
-        if fault_matches(fault, phase) {
+        let event = match phase {
+            lca_platform::PublishPhase::AfterStageFlush => Some("stage_flushed"),
+            lca_platform::PublishPhase::BeforeRename => Some("mutation_started"),
+            lca_platform::PublishPhase::AfterRename => Some("mutation_published"),
+            _ => None,
+        };
+        let holding = hold.is_some_and(|item| fault_matches(item.point, phase));
+        if fault_matches(fault, phase) && !holding {
             injected = Some(fault.phase_name().unwrap_or("fault"));
             return Err(if phase == lca_platform::PublishPhase::DuringReadback {
                 lca_platform::PlatformError::Verify
@@ -1046,11 +1137,6 @@ fn apply_ntfs(
                 lca_platform::PlatformError::Injected
             });
         }
-        let event = match phase {
-            lca_platform::PublishPhase::BeforeRename => Some("mutation_started"),
-            lca_platform::PublishPhase::AfterRename => Some("mutation_published"),
-            _ => None,
-        };
         if let Some(event) = event
             && let Err(error) = audit(event)
         {
@@ -1058,6 +1144,9 @@ fn apply_ntfs(
             return Err(lca_platform::PlatformError::Io(
                 "audit record could not be written".to_owned(),
             ));
+        }
+        if let Some(hold) = hold {
+            hold.park_at(fault_phase(phase));
         }
         Ok(())
     };
@@ -1081,6 +1170,19 @@ fn apply_ntfs(
     Ok(())
 }
 
+fn fault_phase(phase: lca_platform::PublishPhase) -> ApplyFault {
+    match phase {
+        lca_platform::PublishPhase::AfterTempCreate => ApplyFault::AfterTempCreate,
+        lca_platform::PublishPhase::AfterWrite => ApplyFault::AfterWrite,
+        lca_platform::PublishPhase::AfterStageFlush => ApplyFault::AfterStageFlush,
+        lca_platform::PublishPhase::BeforeRename => ApplyFault::BeforeRename,
+        lca_platform::PublishPhase::DuringPublish => ApplyFault::DuringPublish,
+        lca_platform::PublishPhase::AfterRename => ApplyFault::AfterRename,
+        lca_platform::PublishPhase::BeforeReadback => ApplyFault::BeforeReadback,
+        lca_platform::PublishPhase::DuringReadback => ApplyFault::DuringReadback,
+    }
+}
+
 fn fault_matches(fault: ApplyFault, phase: lca_platform::PublishPhase) -> bool {
     matches!(
         (fault, phase),
@@ -1091,8 +1193,14 @@ fn fault_matches(fault: ApplyFault, phase: lca_platform::PublishPhase) -> bool {
             ApplyFault::AfterWrite,
             lca_platform::PublishPhase::AfterWrite
         ) | (
+            ApplyFault::AfterStageFlush,
+            lca_platform::PublishPhase::AfterStageFlush
+        ) | (
             ApplyFault::BeforeRename,
             lca_platform::PublishPhase::BeforeRename
+        ) | (
+            ApplyFault::DuringPublish,
+            lca_platform::PublishPhase::DuringPublish
         ) | (
             ApplyFault::AfterRename,
             lca_platform::PublishPhase::AfterRename
