@@ -201,6 +201,10 @@ impl ModelRuntime for OllamaModelRuntime {
             self.log_failure(request.model(), &error);
             return Err(error);
         }
+        if let Err(error) = reject_structured_stream(&request) {
+            self.log_failure(request.model(), &error);
+            return Err(error);
+        }
         let model = request.model().to_owned();
         let timeout = request.timeout().unwrap_or(self.request_timeout);
         let response = match self.send_chat(&request, true).await {
@@ -273,6 +277,18 @@ impl ModelRuntime for OllamaModelRuntime {
                 Err(error)
             }
         }
+    }
+}
+
+fn reject_structured_stream(request: &GenerationRequest) -> Result<(), RuntimeError> {
+    let structured = !request.tools().is_empty()
+        || request.response_format() != lca_model_runtime::ResponseFormat::Text;
+    if structured {
+        Err(RuntimeError::invalid(
+            "structured output is not streamed in this milestone; call generate",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -349,5 +365,50 @@ mod tests {
         assert_eq!(error.kind(), "invalid_request");
         assert!(error.to_string().contains("loopback"), "{error}");
         assert!(!error.to_string().contains("super-secret-password"));
+    }
+
+    #[tokio::test]
+    async fn structured_requests_fail_before_a_stream_is_opened() {
+        let runtime = OllamaModelRuntime::connect(OllamaRuntimeConfig::new(
+            "http://127.0.0.1:9",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ))
+        .expect("runtime");
+        let tool = lca_model_runtime::ToolDefinition::try_new(
+            "diagnostic_echo",
+            "echo",
+            serde_json::json!({"type": "object"}),
+        )
+        .expect("tool");
+        let request = GenerationRequest::try_new(
+            "lca-agent",
+            vec![lca_model_runtime::Message::user("ping")],
+            lca_model_runtime::GenerationOptions {
+                tools: vec![tool],
+                ..lca_model_runtime::GenerationOptions::default()
+            },
+        )
+        .expect("request");
+        let started = std::time::Instant::now();
+        let error = runtime.generate_stream(request).await.expect_err("stream");
+        assert_eq!(error.kind(), "invalid_request", "{error}");
+        assert!(error.to_string().contains("not streamed"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let json_request = GenerationRequest::try_new(
+            "lca-agent",
+            vec![lca_model_runtime::Message::user("ping")],
+            lca_model_runtime::GenerationOptions {
+                response_format: lca_model_runtime::ResponseFormat::Json,
+                ..lca_model_runtime::GenerationOptions::default()
+            },
+        )
+        .expect("json request");
+        let error = runtime
+            .generate_stream(json_request)
+            .await
+            .expect_err("json stream");
+        assert_eq!(error.kind(), "invalid_request");
     }
 }

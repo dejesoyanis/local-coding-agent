@@ -387,3 +387,107 @@ fn ask_rejects_an_empty_prompt_and_a_remote_endpoint_without_waiting() {
     assert!(stderr.contains("loopback"), "{stderr}");
     assert!(text(&remote.stdout).is_empty(), "{}", text(&remote.stdout));
 }
+
+#[test]
+fn tools_probe_rejects_an_unknown_protocol() {
+    let output = run(&["tools", "probe", "--protocol", "yaml"]);
+    let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert_eq!(output.status.code(), Some(2), "{combined}");
+    assert!(
+        combined.to_ascii_lowercase().contains("protocol"),
+        "{combined}"
+    );
+    assert!(
+        !combined.to_ascii_lowercase().contains("panic"),
+        "{combined}"
+    );
+}
+
+#[test]
+fn tools_probe_validates_a_native_call_against_a_mock_backend() {
+    let workspace = TempDir::new("probe");
+    let before: Vec<_> = fs::read_dir(workspace.path())
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    let show = r#"{"capabilities":["completion","tools"],"details":{"family":"test"}}"#;
+    let chat = r#"{"model":"lca-30b-agent","message":{"role":"assistant","content":"<tool_call>diagnostic_echo</tool_call>","tool_calls":[{"id":"model-id","function":{"name":"diagnostic_echo","arguments":{"message":"hello"}}}]},"done":true,"done_reason":"stop"}"#;
+    let (endpoint, captured) =
+        serve_routes(&[("POST /api/show", 200, show), ("POST /api/chat", 200, chat)]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "tools",
+        "probe",
+        "--protocol",
+        "native",
+        "--config",
+        config.to_str().expect("utf-8"),
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        stdout,
+        "protocol: native\ntool: diagnostic_echo\nvalidation: passed\nexecution: disabled\n"
+    );
+    let requests = captured.lock().expect("capture").clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].contains("POST /api/show"), "{}", requests[0]);
+    assert!(requests[1].contains("POST /api/chat"), "{}", requests[1]);
+    assert!(requests[1].contains("\"stream\":false"), "{}", requests[1]);
+    assert!(requests[1].contains("diagnostic_echo"), "{}", requests[1]);
+    assert!(!requests[1].contains("\"format\""), "{}", requests[1]);
+    let after: Vec<_> = fs::read_dir(workspace.path())
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(before, Vec::<std::ffi::OsString>::new());
+    assert_eq!(after.len(), 1, "{after:?}");
+}
+
+fn serve_routes(routes: &[(&str, u16, &str)]) -> (String, Arc<Mutex<Vec<String>>>) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let captured_thread = Arc::clone(&captured);
+    let routes: Vec<(String, u16, String)> = routes
+        .iter()
+        .map(|(path, status, body)| ((*path).to_owned(), *status, (*body).to_owned()))
+        .collect();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut served = 0;
+        while served < routes.len() && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let Ok(request) = read_http(&mut stream) else {
+                        continue;
+                    };
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let (status, body) = routes
+                        .iter()
+                        .find(|(path, _, _)| text.contains(path))
+                        .map(|(_, status, body)| (*status, body.as_str()))
+                        .unwrap_or((500, ""));
+                    captured_thread.lock().expect("capture").push(text);
+                    let reason = if status == 200 { "OK" } else { "Error" };
+                    let header = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                    served += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{address}"), captured)
+}

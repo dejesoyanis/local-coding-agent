@@ -1,13 +1,15 @@
 //! Command-line composition root for the local coding agent foundation.
 //!
-//! `status`, `config validate`, and `workspace info` load configuration and report it.
-//! Status probes Ollama and reports an unavailable server without panicking. This binary
-//! does not start an agent loop and does not execute tools.
+//! `status`, `config validate`, `workspace info`, and `tools probe` load configuration.
+//! Status probes Ollama and reports an unavailable server without panicking. `tools probe`
+//! validates a structured tool call. This binary does not start an agent loop and does not
+//! execute tools.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod ask;
+mod probe;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use lca_config::{AgentConfig, ConfigError, load_from_path};
 use lca_core::AgentLifecycle;
+use lca_model_runtime::ProtocolPreference;
 use lca_ollama::{HttpOllamaClient, OllamaAvailability, OllamaClient};
 
 /// Text produced by one invocation.
@@ -88,6 +91,12 @@ where
             model,
             prompt,
         }),
+        Command::Tools {
+            action: ToolsAction::Probe { protocol },
+        } => Invocation::Buffered(probe::run_probe(&probe::ProbeCommand {
+            config: config_path,
+            protocol: protocol.preference(),
+        })),
     }
 }
 
@@ -151,6 +160,41 @@ enum Command {
         #[arg(value_name = "PROMPT")]
         prompt: String,
     },
+    /// Inspect structured tool calling without executing a tool.
+    Tools {
+        #[command(subcommand)]
+        action: ToolsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ToolsAction {
+    /// Ask the model for diagnostic_echo and validate the proposal.
+    Probe {
+        /// `native`, `json`, or `auto`. The default is `auto`.
+        #[arg(long, value_enum, default_value = "auto")]
+        protocol: CliProtocol,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CliProtocol {
+    /// Native tool calls. Requires a confirmed backend capability.
+    Native,
+    /// Versioned JSON action document.
+    Json,
+    /// Native when confirmed, otherwise the JSON document.
+    Auto,
+}
+
+impl CliProtocol {
+    const fn preference(self) -> ProtocolPreference {
+        match self {
+            Self::Native => ProtocolPreference::Native,
+            Self::Json => ProtocolPreference::StructuredJson,
+            Self::Auto => ProtocolPreference::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]

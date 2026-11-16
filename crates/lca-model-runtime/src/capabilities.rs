@@ -9,6 +9,24 @@ pub enum CapabilityStatus {
     Unknown,
 }
 
+impl CapabilityStatus {
+    /// Stable name used in diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::NotReported => "not_reported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilityStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Pieces of a capability report before sanitizing.
 ///
 /// Adapters fill only values the backend returned. [`ModelCapabilities::from_parts`]

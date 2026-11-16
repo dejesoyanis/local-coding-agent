@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::tool::RawToolCall;
+
 /// Why the backend stopped generating.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
@@ -78,13 +80,17 @@ impl TimingMetadata {
 }
 
 /// Completed non-streaming generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `tool_calls` holds raw backend calls. An empty list is the LCA-01B text response.
+/// JSON values are [`PartialEq`] and not [`Eq`], so this type is not [`Eq`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerationResponse {
     model: String,
     text: String,
     finish_reason: Option<FinishReason>,
     usage: Option<TokenUsage>,
     timing: Option<TimingMetadata>,
+    tool_calls: Vec<RawToolCall>,
 }
 
 impl GenerationResponse {
@@ -105,7 +111,15 @@ impl GenerationResponse {
             finish_reason,
             usage,
             timing,
+            tool_calls: Vec::new(),
         }
+    }
+
+    /// Attaches raw tool calls without validating or executing them.
+    #[must_use]
+    pub fn with_tool_calls(mut self, tool_calls: Vec<RawToolCall>) -> Self {
+        self.tool_calls = tool_calls;
+        self
     }
 
     /// Model identifier reported for this response, or the requested model when the backend omitted it.
@@ -136,6 +150,14 @@ impl GenerationResponse {
     #[must_use]
     pub const fn timing(&self) -> Option<TimingMetadata> {
         self.timing
+    }
+
+    /// Raw tool calls in backend order. Empty when the backend sent none.
+    ///
+    /// Text that merely looks like a tool call is not represented here.
+    #[must_use]
+    pub fn tool_calls(&self) -> &[RawToolCall] {
+        &self.tool_calls
     }
 }
 
@@ -247,6 +269,7 @@ mod tests {
         assert_eq!(response.finish_reason(), None);
         assert_eq!(response.usage(), None);
         assert_eq!(response.timing(), None);
+        assert!(response.tool_calls().is_empty());
     }
 
     #[test]

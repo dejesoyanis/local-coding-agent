@@ -3,7 +3,8 @@
 //! [`HttpOllamaClient`] is the LCA-01A health check. It calls `/api/version` and `/api/tags`
 //! and does not generate text. [`OllamaModelRuntime`] is the generation adapter: it implements
 //! the backend-neutral [`lca_model_runtime::ModelRuntime`] contract with chat, streaming, and
-//! capability lookup. Neither client calls tools or downloads models.
+//! capability lookup. The adapter can transport native tool calls. It does not validate them
+//! against a registry, execute them, or download models.
 //!
 //! Unit and integration tests use an in-process HTTP stub or no network at all. They do not
 //! require Ollama to be running. The ignored smoke test is the only optional live call.

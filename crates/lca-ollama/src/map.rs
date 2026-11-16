@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use lca_model_runtime::{
     CapabilityParts, CapabilityStatus, FinishReason, GenerationEvent, GenerationMetadata,
-    GenerationRequest, GenerationResponse, ModelCapabilities, RuntimeError, TimingMetadata,
-    TokenUsage,
+    GenerationRequest, GenerationResponse, MAX_NATIVE_TOOL_CALLS, ModelCapabilities, RawToolCall,
+    ResponseFormat, RuntimeError, TimingMetadata, TokenUsage,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -18,12 +18,30 @@ struct ChatPayload {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<ChatOptions>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<OllamaTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: OllamaFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaFunction {
+    name: String,
+    description: String,
+    parameters: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +92,10 @@ struct ChatChunk {
 struct ChatMessageOut {
     #[serde(default)]
     content: Option<String>,
+    /// Kept as raw JSON so a streaming frame with an unexpected shape still yields text.
+    /// Non-streaming responses interpret this value separately and do not repair it.
+    #[serde(default)]
+    tool_calls: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +129,8 @@ pub(crate) fn chat_payload(
         messages: mapped_messages(request),
         stream,
         options: options_of(request),
+        tools: ollama_tools(request),
+        format: json_format(request),
     };
     serde_json::to_value(payload)
         .map_err(|_| RuntimeError::invalid("generation request could not be encoded"))
@@ -127,13 +151,18 @@ pub(crate) fn response_from_chat_json(
         ));
     }
     let metadata = metadata_from(&chunk, fallback_model);
+    let tool_calls = match chunk.message.as_ref() {
+        Some(message) => tool_calls_from(message.tool_calls.as_ref())?,
+        None => Vec::new(),
+    };
     Ok(GenerationResponse::complete(
         metadata.model(),
         content_of(&chunk),
         metadata.finish_reason().cloned(),
         metadata.usage(),
         metadata.timing(),
-    ))
+    )
+    .with_tool_calls(tool_calls))
 }
 
 /// Converts one NDJSON frame into zero or more events, or a terminal stream error.
@@ -146,6 +175,8 @@ pub(crate) fn interpret_line(
         return Err(error_from_backend_message(message, fallback_model, None));
     }
     let mut events = Vec::new();
+    // Tool calls are not streamed. A frame may still carry a `tool_calls` field; it is not
+    // turned into an event and it is not parsed out of the text.
     let content = content_of(&chunk);
     if !content.is_empty() {
         events.push(GenerationEvent::TextDelta(content));
@@ -209,6 +240,71 @@ fn mapped_messages(request: &GenerationRequest) -> Vec<ChatMessage> {
         });
     }
     messages
+}
+
+fn ollama_tools(request: &GenerationRequest) -> Vec<OllamaTool> {
+    request
+        .tools()
+        .iter()
+        .map(|tool| OllamaTool {
+            kind: "function",
+            function: OllamaFunction {
+                name: tool.name().to_owned(),
+                description: tool.description().to_owned(),
+                parameters: tool.parameters().clone(),
+            },
+        })
+        .collect()
+}
+
+fn json_format(request: &GenerationRequest) -> Option<&'static str> {
+    match request.response_format() {
+        ResponseFormat::Json => Some("json"),
+        ResponseFormat::Text => None,
+    }
+}
+
+/// Interprets native `tool_calls`. Text markers such as `<tool_call>` are not consulted.
+fn tool_calls_from(value: Option<&Value>) -> Result<Vec<RawToolCall>, RuntimeError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = value else {
+        return Err(RuntimeError::protocol("tool_calls must be an array"));
+    };
+    if items.len() > MAX_NATIVE_TOOL_CALLS {
+        return Err(RuntimeError::protocol(format!(
+            "response contains more than {MAX_NATIVE_TOOL_CALLS} tool calls"
+        )));
+    }
+    items.iter().map(one_tool_call).collect()
+}
+
+fn one_tool_call(value: &Value) -> Result<RawToolCall, RuntimeError> {
+    let Some(call) = value.as_object() else {
+        return Err(RuntimeError::protocol("tool call must be an object"));
+    };
+    let Some(function) = call.get("function").and_then(Value::as_object) else {
+        return Err(RuntimeError::protocol("tool call is missing function"));
+    };
+    let Some(name) = function.get("name").and_then(Value::as_str) else {
+        return Err(RuntimeError::protocol(
+            "tool call is missing a function name",
+        ));
+    };
+    if name.is_empty() {
+        return Err(RuntimeError::protocol("tool call function name is empty"));
+    }
+    let arguments = match function.get("arguments") {
+        None => Value::Object(Map::new()),
+        Some(Value::Object(arguments)) => Value::Object(arguments.clone()),
+        Some(_) => {
+            return Err(RuntimeError::protocol(
+                "tool call arguments must be a JSON object",
+            ));
+        }
+    };
+    Ok(RawToolCall::new(name, arguments))
 }
 
 fn options_of(request: &GenerationRequest) -> Option<ChatOptions> {
@@ -425,6 +521,7 @@ mod tests {
                 max_tokens: Some(128),
                 context_tokens: Some(4096),
                 timeout: Some(Duration::from_secs(30)),
+                ..GenerationOptions::default()
             },
         )
         .expect("request")
@@ -630,5 +727,147 @@ mod tests {
         assert_eq!(explicit.tools(), CapabilityStatus::Confirmed);
         assert_eq!(explicit.json_mode(), CapabilityStatus::Confirmed);
         assert_eq!(explicit.chat(), CapabilityStatus::NotReported);
+    }
+
+    #[test]
+    fn chat_payload_advertises_tools_and_json_format_only_when_requested() {
+        use lca_model_runtime::{ResponseFormat, ToolDefinition};
+        use serde_json::json;
+
+        let tool = ToolDefinition::try_new(
+            "diagnostic_echo",
+            "Return the provided message.",
+            json!({"type": "object"}),
+        )
+        .expect("tool");
+        let request = GenerationRequest::try_new(
+            "lca-agent",
+            vec![Message::user("call the tool")],
+            GenerationOptions {
+                tools: vec![tool],
+                response_format: ResponseFormat::Json,
+                ..GenerationOptions::default()
+            },
+        )
+        .expect("request");
+        let payload = chat_payload(&request, false).expect("payload");
+        assert_eq!(payload["stream"], false);
+        assert_eq!(payload["format"], "json");
+        let tools = payload["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "diagnostic_echo");
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+        assert!(payload["messages"][0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn native_tool_calls_keep_order_and_json_arguments() {
+        let response = response_from_chat_json(
+            br#"{"model":"lca-agent","message":{"role":"assistant","content":"","tool_calls":[{"id":"model-supplied","function":{"name":"diagnostic_echo","arguments":{"message":"one"}}},{"function":{"name":"diagnostic_echo","arguments":{"message":"two"}}}]},"done":true,"done_reason":"stop"}"#,
+            "fallback",
+        )
+        .expect("calls");
+        assert_eq!(response.text(), "");
+        let calls = response.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name(), "diagnostic_echo");
+        assert_eq!(calls[0].arguments()["message"], "one");
+        assert_eq!(calls[1].arguments()["message"], "two");
+        assert!(!format!("{calls:?}").contains("model-supplied"));
+    }
+
+    #[test]
+    fn empty_tool_calls_and_text_markers_are_not_actions() {
+        let empty = response_from_chat_json(
+            br#"{"model":"m","message":{"role":"assistant","content":"hello","tool_calls":[]},"done":true}"#,
+            "m",
+        )
+        .expect("empty");
+        assert!(empty.tool_calls().is_empty());
+        assert_eq!(empty.text(), "hello");
+
+        let marker = response_from_chat_json(
+            br#"{"model":"m","message":{"role":"assistant","content":"use <tool_call>diagnostic_echo</tool_call> and <function=diagnostic_echo>"},"done":true}"#,
+            "m",
+        )
+        .expect("marker");
+        assert!(marker.tool_calls().is_empty());
+        assert!(marker.text().contains("<tool_call>"));
+        assert!(marker.text().contains("<function=diagnostic_echo>"));
+
+        let missing_arguments = response_from_chat_json(
+            br#"{"model":"m","message":{"content":"","tool_calls":[{"function":{"name":"diagnostic_echo"}}]},"done":true}"#,
+            "m",
+        )
+        .expect("missing arguments");
+        assert_eq!(
+            missing_arguments.tool_calls()[0].arguments(),
+            &serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn malformed_native_tool_calls_are_protocol_errors() {
+        let cases = [
+            br#"{"model":"m","message":{"content":"","tool_calls":"diagnostic_echo"},"done":true}"#.as_slice(),
+            br#"{"model":"m","message":{"content":"","tool_calls":[{"function":{"name":"diagnostic_echo","arguments":"{\"message\":\"hello\"}"}}]},"done":true}"#,
+            br#"{"model":"m","message":{"content":"","tool_calls":[{"name":"diagnostic_echo"}]},"done":true}"#,
+            br#"{"model":"m","message":{"content":"","tool_calls":[{"function":{"name":""}}]},"done":true}"#,
+            br#"{"model":"m","message":{"content":"","tool_calls":[{},{},{},{},{},{},{},{},{}]},"done":true}"#,
+        ];
+        for case in cases {
+            let error = response_from_chat_json(case, "m").expect_err("malformed");
+            assert_eq!(error.kind(), "protocol_violation", "{error}");
+            assert!(!error.to_string().contains("hello"), "{error}");
+            assert!(!error.to_string().contains('{'), "{error}");
+        }
+    }
+
+    #[test]
+    fn observed_ollama_0_40_tool_call_shape_is_preserved() {
+        // Captured from Ollama 0.40.16 with qwen3:8b, stream false.
+        // The model id and function index are not copied into the runtime call.
+        let response = response_from_chat_json(
+            br#"{"model":"qwen3:8b","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_yqfuarki","function":{"index":0,"name":"diagnostic_echo","arguments":{"message":"hello"}}}]},"done":true,"done_reason":"stop"}"#,
+            "fallback",
+        )
+        .expect("observed");
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].name(), "diagnostic_echo");
+        assert_eq!(response.tool_calls()[0].arguments()["message"], "hello");
+        assert!(!format!("{:?}", response.tool_calls()).contains("call_yqfuarki"));
+    }
+
+    #[test]
+    fn stream_frames_do_not_interpret_tool_calls() {
+        let events = interpret_line(
+            r#"{"message":{"content":"Hello","tool_calls":"not-a-call"},"done":false}"#,
+            "fallback",
+        )
+        .expect("text frame");
+        assert_eq!(events, vec![GenerationEvent::TextDelta("Hello".to_owned())]);
+
+        let marked = interpret_line(
+            r#"{"message":{"content":"<tool_call>diagnostic_echo</tool_call>"},"done":true,"done_reason":"stop"}"#,
+            "fallback",
+        )
+        .expect("marker frame");
+        assert!(matches!(
+            &marked[..],
+            [
+                GenerationEvent::TextDelta(text),
+                GenerationEvent::Completed(_)
+            ] if text.contains("<tool_call>")
+        ));
+
+        // Ollama 0.40.16 with qwen3:8b put a complete tool call on a non-terminal frame.
+        // The stream decoder does not turn that frame into an action.
+        let native = interpret_line(
+            r#"{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_6205uk6a","function":{"index":0,"name":"diagnostic_echo","arguments":{"message":"hello"}}}]},"done":false}"#,
+            "fallback",
+        )
+        .expect("native stream frame");
+        assert!(native.is_empty(), "{native:?}");
     }
 }

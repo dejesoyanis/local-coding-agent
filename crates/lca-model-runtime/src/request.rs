@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::error::RuntimeError;
 use crate::message::Message;
+use crate::tool::{MAX_TOOLS_PER_REQUEST, ResponseFormat, ToolDefinition};
 
 /// Largest accepted model identifier, in bytes.
 pub const MAX_MODEL_NAME_LEN: usize = 256;
@@ -50,6 +51,10 @@ pub struct GenerationOptions {
     pub timeout: Option<Duration>,
     /// Context window in tokens.
     pub context_tokens: Option<u32>,
+    /// Tool definitions to advertise. Empty keeps the text-only request shape.
+    pub tools: Vec<ToolDefinition>,
+    /// Requested shape of the assistant text. The default is ordinary text.
+    pub response_format: ResponseFormat,
 }
 
 /// Validated request for one generation.
@@ -65,6 +70,8 @@ pub struct GenerationRequest {
     max_tokens: Option<u32>,
     timeout: Option<Duration>,
     context_tokens: Option<u32>,
+    tools: Vec<ToolDefinition>,
+    response_format: ResponseFormat,
 }
 
 impl GenerationRequest {
@@ -129,6 +136,7 @@ impl GenerationRequest {
             ));
         }
         validate_sampling(&self.sampling)?;
+        validate_tools(&self.tools)?;
         Ok(())
     }
 
@@ -183,6 +191,18 @@ impl GenerationRequest {
         self.context_tokens
     }
 
+    /// Tool definitions advertised with this request.
+    #[must_use]
+    pub fn tools(&self) -> &[ToolDefinition] {
+        &self.tools
+    }
+
+    /// Requested assistant-text shape.
+    #[must_use]
+    pub const fn response_format(&self) -> ResponseFormat {
+        self.response_format
+    }
+
     fn from_parts(model: String, messages: Vec<Message>, options: GenerationOptions) -> Self {
         Self {
             model,
@@ -192,8 +212,30 @@ impl GenerationRequest {
             max_tokens: options.max_tokens,
             timeout: options.timeout,
             context_tokens: options.context_tokens,
+            tools: options.tools,
+            response_format: options.response_format,
         }
     }
+}
+
+fn validate_tools(tools: &[ToolDefinition]) -> Result<(), RuntimeError> {
+    if tools.len() > MAX_TOOLS_PER_REQUEST {
+        return Err(RuntimeError::invalid(
+            "generation request has too many tools",
+        ));
+    }
+    let mut names = Vec::with_capacity(tools.len());
+    for tool in tools {
+        tool.validate()?;
+        if names
+            .iter()
+            .any(|existing: &String| existing == tool.name())
+        {
+            return Err(RuntimeError::invalid("tool names must be unique"));
+        }
+        names.push(tool.name().to_owned());
+    }
+    Ok(())
 }
 
 fn validate_model(model: &str) -> Result<(), RuntimeError> {
@@ -287,6 +329,7 @@ mod tests {
                 max_tokens: Some(128),
                 timeout: Some(Duration::from_secs(30)),
                 context_tokens: Some(4096),
+                ..GenerationOptions::default()
             },
         )
         .expect("request");

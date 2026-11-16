@@ -13,6 +13,8 @@ lca-config = { path = "../../crates/lca-config" }
 lca-core = { path = "../../crates/lca-core" }
 lca-model-runtime = { path = "../../crates/lca-model-runtime" }
 lca-ollama = { path = "../../crates/lca-ollama" }
+lca-tools = { path = "../../crates/lca-tools" }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "ansi"] }
