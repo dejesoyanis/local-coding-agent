@@ -21,6 +21,7 @@ use lca_tools::FsOutcome;
 use serde_json::json;
 
 use crate::CommandOutput;
+use crate::publish::persist_prepared;
 use crate::tools_cmd::{limits_from, sandbox_from};
 
 /// Arguments for `lca agent execute`.
@@ -69,6 +70,7 @@ pub fn run_execute(command: &ExecuteCommand) -> CommandOutput {
         Ok(registry) => registry,
         Err(error) => return failure(&error.to_string()),
     };
+    let stored = sandbox.clone();
     let controller = BoundedAgentController::new(
         registry,
         sandbox,
@@ -105,9 +107,27 @@ pub fn run_execute(command: &ExecuteCommand) -> CommandOutput {
             .await
     });
     match report {
-        Ok(report) => render(&report, command.json),
+        Ok(report) => {
+            let ids = match persist_prepared(&stored, &prepared_patches(&report)) {
+                Ok(ids) => ids,
+                Err(error) => return failure(&error),
+            };
+            render(&report, &ids, command.json)
+        }
         Err(error) => failure(&explain_loop(&error)),
     }
+}
+
+fn prepared_patches(report: &RunReport) -> Vec<&lca_tools::PreparedPatch> {
+    report
+        .turns()
+        .iter()
+        .flat_map(|turn| turn.actions())
+        .filter_map(|action| match action.outcome() {
+            FsOutcome::Prepared(prepared) => Some(prepared.as_ref()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn budgets_from(config: &AgentConfig, command: &ExecuteCommand) -> Result<AgentBudgets, String> {
@@ -143,11 +163,11 @@ fn connect(config: &AgentConfig) -> Result<OllamaModelRuntime, RuntimeError> {
     ))
 }
 
-fn render(report: &RunReport, json_output: bool) -> CommandOutput {
+fn render(report: &RunReport, proposal_ids: &[String], json_output: bool) -> CommandOutput {
     let stdout = if json_output {
-        render_json(report)
+        render_json(report, proposal_ids)
     } else {
-        render_text(report)
+        render_text(report, proposal_ids)
     };
     let failed = !matches!(report.status(), RunStatus::Completed);
     CommandOutput {
@@ -164,8 +184,9 @@ fn render(report: &RunReport, json_output: bool) -> CommandOutput {
     }
 }
 
-fn render_text(report: &RunReport) -> String {
+fn render_text(report: &RunReport, proposal_ids: &[String]) -> String {
     let mut out = String::new();
+    let mut ids = proposal_ids.iter();
     push(
         &mut out,
         "protocol",
@@ -198,7 +219,7 @@ fn render_text(report: &RunReport) -> String {
             }
         }
         for action in turn.actions() {
-            render_action(&mut out, action);
+            render_action(&mut out, action, &mut ids);
         }
     }
     if report.stop_reason() == StopReason::FinalAnswer && report.turns().is_empty() {
@@ -211,7 +232,11 @@ fn render_text(report: &RunReport) -> String {
     out
 }
 
-fn render_action(out: &mut String, action: &ExecutedAction) {
+fn render_action<'a>(
+    out: &mut String,
+    action: &ExecutedAction,
+    ids: &mut impl Iterator<Item = &'a String>,
+) {
     push(out, "tool", action.tool());
     match action.outcome() {
         FsOutcome::NotExecuted { .. } => push(out, "result", "not_executed"),
@@ -242,6 +267,10 @@ fn render_action(out: &mut String, action: &ExecutedAction) {
             push(out, "path", prepared.relative_path());
             push(out, "applied", "false");
             push(out, "approval", "unavailable");
+            if let Some(id) = ids.next() {
+                push(out, "proposal_id", id);
+                push(out, "proposal_state", "prepared");
+            }
             out.push_str("diff:\n");
             out.push_str(prepared.diff());
             if !prepared.diff().ends_with('\n') {
@@ -251,7 +280,8 @@ fn render_action(out: &mut String, action: &ExecutedAction) {
     }
 }
 
-fn render_json(report: &RunReport) -> String {
+fn render_json(report: &RunReport, proposal_ids: &[String]) -> String {
+    let mut ids = proposal_ids.iter();
     let turns = report
         .turns()
         .iter()
@@ -259,10 +289,19 @@ fn render_json(report: &RunReport) -> String {
             json!({
                 "turn": turn.index(),
                 "final_answer": turn.final_answer(),
-                "actions": turn.actions().iter().map(|action| json!({
-                    "tool": action.tool(),
-                    "result": result_name(action),
-                })).collect::<Vec<_>>(),
+                "actions": turn.actions().iter().map(|action| {
+                    let mut value = json!({
+                        "tool": action.tool(),
+                        "result": result_name(action),
+                    });
+                    if matches!(action.outcome(), FsOutcome::Prepared(_))
+                        && let Some(id) = ids.next()
+                    {
+                        value["proposal_id"] = json!(id);
+                        value["proposal_state"] = json!("prepared");
+                    }
+                    value
+                }).collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();

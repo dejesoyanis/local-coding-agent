@@ -14,6 +14,7 @@ use lca_ollama::{OllamaModelRuntime, OllamaRuntimeConfig};
 use lca_tools::{FsOutcome, ToolRegistry};
 
 use crate::CommandOutput;
+use crate::publish::persist_prepared;
 use crate::tools_cmd::{limits_from, sandbox_from};
 
 /// Arguments for `lca agent run`.
@@ -53,6 +54,7 @@ pub fn run_agent(command: &AgentCommand) -> CommandOutput {
         Err(error) => return failure(&error.to_string()),
     };
     let max_actions = usize::try_from(config.max_steps()).unwrap_or(lca_tools::MAX_ACTIONS);
+    let stored = sandbox.clone();
     let controller = match SingleTurnAgentController::new(
         registry,
         sandbox,
@@ -77,7 +79,20 @@ pub fn run_agent(command: &AgentCommand) -> CommandOutput {
         Err(error) => return failure(&format!("failed to start the runtime: {error}")),
     };
     match tokio_runtime.block_on(controller.run(&runtime, &command.prompt, SystemTime::now())) {
-        Ok(report) => render_report(&report),
+        Ok(report) => {
+            let patches = report
+                .actions()
+                .iter()
+                .filter_map(|action| match action.outcome() {
+                    FsOutcome::Prepared(prepared) => Some(prepared.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            match persist_prepared(&stored, &patches) {
+                Ok(ids) => render_report(&report, &ids),
+                Err(error) => failure(&error),
+            }
+        }
         Err(error) => render_failure(&error),
     }
 }
@@ -90,8 +105,9 @@ fn connect(config: &AgentConfig) -> Result<OllamaModelRuntime, RuntimeError> {
     ))
 }
 
-fn render_report(report: &TurnReport) -> CommandOutput {
+fn render_report(report: &TurnReport, proposal_ids: &[String]) -> CommandOutput {
     let mut stdout = String::new();
+    let mut ids = proposal_ids.iter();
     push_header(
         &mut stdout,
         report.protocol().as_str(),
@@ -107,7 +123,7 @@ fn render_report(report: &TurnReport) -> CommandOutput {
         push(&mut stdout, "diagnostic", diagnostic);
     };
     for action in report.actions() {
-        render_action(&mut stdout, action);
+        render_action(&mut stdout, action, &mut ids);
     }
     push_model_text(&mut stdout, report.text());
     CommandOutput {
@@ -119,8 +135,9 @@ fn render_report(report: &TurnReport) -> CommandOutput {
 
 fn render_failure(error: &TurnError) -> CommandOutput {
     let mut stdout = String::new();
+    let mut ids = std::iter::empty::<&String>();
     for action in error.prior_actions() {
-        render_action(&mut stdout, action);
+        render_action(&mut stdout, action, &mut ids);
     }
     CommandOutput {
         exit_code: 1,
@@ -142,7 +159,11 @@ fn push_header(out: &mut String, protocol: &str, model_calls: u32, actions: usiz
     push(out, "actions", &actions.to_string());
 }
 
-fn render_action(out: &mut String, action: &ExecutedAction) {
+fn render_action<'a>(
+    out: &mut String,
+    action: &ExecutedAction,
+    ids: &mut impl Iterator<Item = &'a String>,
+) {
     push(out, "action", &action.id().to_string());
     push(out, "tool", action.tool());
     push(out, "source", action.source().as_str());
@@ -192,6 +213,10 @@ fn render_action(out: &mut String, action: &ExecutedAction) {
             push(out, "path", prepared.relative_path());
             push(out, "approval", "required");
             push(out, "applied", "false");
+            if let Some(id) = ids.next() {
+                push(out, "proposal_id", id);
+                push(out, "proposal_state", "prepared");
+            }
             push(out, "action_id", &prepared.action_id().to_string());
             push(out, "line_ending", prepared.line_ending());
             push(out, "original_hash", &prepared.original_hash_hex());

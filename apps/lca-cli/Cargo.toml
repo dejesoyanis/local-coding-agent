@@ -21,6 +21,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", 
 
 [dev-dependencies]
 async-trait = "0.1"
+lca-platform = { path = "../../crates/lca-platform" }
+lca-tools = { path = "../../crates/lca-tools" }
+serde_json = "1"
 
 [lib]
 name = "lca_cli"

@@ -940,6 +940,27 @@ fn a_junction_cannot_expose_a_protected_file_or_escape() {
     drop(guard);
 }
 
+#[cfg(windows)]
+#[test]
+fn prepare_rejects_a_hardlink_and_does_not_change_either_name() {
+    let root = TempDir::new("patch-hardlink");
+    let sandbox = WorkspaceSandbox::new(root.path()).expect("sandbox");
+    let file = root.path().join("notes.txt");
+    let alias = root.path().join("alias.txt");
+    write(&file, "alpha\n");
+    std::fs::hard_link(&file, &alias).expect("hard link");
+    let patch = patch_text("notes.txt", "alpha", "beta");
+    let error = execute_validated(
+        &action("apply_patch", json!({"path": "notes.txt", "patch": patch})),
+        &sandbox,
+        &wide_limits(),
+    )
+    .expect_err("hardlink");
+    assert_eq!(error.kind(), "hardlink_denied", "{error}");
+    assert_eq!(std::fs::read_to_string(&file).expect("file"), "alpha\n");
+    assert_eq!(std::fs::read_to_string(&alias).expect("alias"), "alpha\n");
+}
+
 #[test]
 fn a_hardlink_alias_of_a_protected_file_is_not_detected() {
     let root = TempDir::new("privacy-hardlink");

@@ -6,6 +6,7 @@ members = [
     "crates/lca-config",
     "crates/lca-model-runtime",
     "crates/lca-ollama",
+    "crates/lca-platform",
     "crates/lca-tools",
 ]
 # lca-test is an independent benchmark project and must stay outside this workspace.

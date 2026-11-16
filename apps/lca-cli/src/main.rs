@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -13,7 +13,25 @@ fn main() -> ExitCode {
         lca_cli::Invocation::Buffered(output) => write_buffered(output),
         lca_cli::Invocation::Ask(command) => stream_ask(command),
         lca_cli::Invocation::Patch(command) => confirm_patch(command),
+        lca_cli::Invocation::ProposalApprove(command) => approve_proposal(command),
     }
+}
+
+fn approve_proposal(command: lca_cli::ProposalApproveCommand) -> ExitCode {
+    if !io::stdin().is_terminal() {
+        let _ = writeln!(
+            io::stderr(),
+            "lca: approval requires an interactive console"
+        );
+        return ExitCode::from(1);
+    }
+    let code = lca_cli::run_proposal_approve(
+        &command,
+        &mut io::stdin().lock(),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    );
+    ExitCode::from(code)
 }
 
 fn confirm_patch(command: lca_cli::PatchCommand) -> ExitCode {

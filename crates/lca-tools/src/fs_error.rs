@@ -109,6 +109,13 @@ pub enum FsError {
         path: String,
     },
 
+    /// The target has more than one name. A workspace hard link can alias bytes outside the root.
+    #[error("path {path} has more than one hard link")]
+    HardlinkDenied {
+        /// Caller path, capped for diagnostics.
+        path: String,
+    },
+
     /// The platform did not provide a file index that can be compared later.
     #[error("path {path} has no usable file identity")]
     UnverifiableIdentity {
@@ -231,6 +238,32 @@ pub enum FsError {
     #[error("approval ledger is unavailable")]
     LedgerUnavailable,
 
+    /// The stored proposal is not a valid protected record.
+    #[error("patch proposal was rejected: {message}")]
+    ProposalInvalid {
+        /// Static explanation. It does not include file bytes.
+        message: String,
+    },
+
+    /// The proposal is past its expiry.
+    #[error("patch proposal has expired")]
+    ProposalExpired,
+
+    /// This platform cannot verify an apply.
+    #[error("verified patch apply is not supported on this platform")]
+    UnsupportedPlatform,
+
+    /// The proposal belongs to a different workspace identity.
+    #[error("patch proposal is bound to a different workspace")]
+    WorkspaceMismatch,
+
+    /// The protected proposal store could not be used.
+    #[error("proposal store is unavailable: {message}")]
+    StoreUnavailable {
+        /// Static explanation. It does not include file bytes.
+        message: String,
+    },
+
     /// A directory or search exceeded a hard scan cap.
     #[error("{message}")]
     LimitExceeded {
@@ -258,6 +291,7 @@ impl FsError {
             Self::TooLarge { .. } => "too_large",
             Self::FileChanged { .. } => "file_changed",
             Self::IdentityChanged { .. } => "identity_changed",
+            Self::HardlinkDenied { .. } => "hardlink_denied",
             Self::UnverifiableIdentity { .. } => "unverifiable_identity",
             Self::ProtectedPath { .. } => "protected_path",
             Self::PrivacyDenied => "privacy_denied",
@@ -277,6 +311,11 @@ impl FsError {
             Self::Io { .. } => "io",
             Self::UnsupportedTool { .. } => "unsupported_tool",
             Self::LedgerUnavailable => "ledger_unavailable",
+            Self::ProposalInvalid { .. } => "proposal_invalid",
+            Self::ProposalExpired => "proposal_expired",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::WorkspaceMismatch => "workspace_mismatch",
+            Self::StoreUnavailable { .. } => "store_unavailable",
             Self::LimitExceeded { .. } => "limit_exceeded",
         }
     }

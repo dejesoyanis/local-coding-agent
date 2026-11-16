@@ -15,7 +15,9 @@ mod agent;
 mod ask;
 mod eval_cmd;
 mod execute;
+mod patch_cmd;
 mod probe;
+mod publish;
 mod tools_cmd;
 
 use std::ffi::OsString;
@@ -62,6 +64,8 @@ pub enum Invocation {
     Ask(AskCommand),
     /// A patch preview that must be shown before the confirmation line is read.
     Patch(PatchCommand),
+    /// A stored proposal that must be confirmed on an interactive console.
+    ProposalApprove(patch_cmd::ProposalApproveCommand),
 }
 
 /// Arguments for `lca tools patch prepare`.
@@ -146,6 +150,31 @@ where
             runs,
             output,
         })),
+        Command::Eval {
+            action: EvalCli::Agent { live, output },
+        } => Invocation::Buffered(eval_cmd::run_agent_eval(&eval_cmd::AgentEvalCommand {
+            config: config_path,
+            live,
+            output,
+        })),
+        Command::Patch { action } => match action {
+            ProposalCli::List => Invocation::Buffered(patch_cmd::run_list(&config_path)),
+            ProposalCli::Show { id } => {
+                Invocation::Buffered(patch_cmd::run_show(&config_path, &id))
+            }
+            ProposalCli::Status { id } => {
+                Invocation::Buffered(patch_cmd::run_status(&config_path, &id))
+            }
+            ProposalCli::Reject { id } => {
+                Invocation::Buffered(patch_cmd::run_reject(&config_path, &id))
+            }
+            ProposalCli::Approve { id } => {
+                Invocation::ProposalApprove(patch_cmd::ProposalApproveCommand {
+                    config: config_path,
+                    id,
+                })
+            }
+        },
         Command::Tools { action } => match action {
             ToolsAction::Probe { protocol } => {
                 Invocation::Buffered(probe::run_probe(&probe::ProbeCommand {
@@ -193,10 +222,16 @@ where
             stdout: String::new(),
             stderr: "lca: patch prepare is confirmed by the lca binary\n".to_owned(),
         },
+        Invocation::ProposalApprove(_) => CommandOutput {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: "lca: patch approve is confirmed by the lca binary\n".to_owned(),
+        },
     }
 }
 
 pub use ask::run_ask;
+pub use patch_cmd::{ProposalApproveCommand, run_proposal_approve};
 pub use tools_cmd::run_patch_session;
 
 #[derive(Debug, Parser)]
@@ -247,6 +282,11 @@ enum Command {
         /// Prompt text.
         #[arg(value_name = "PROMPT")]
         prompt: String,
+    },
+    /// Review a stored patch proposal. Approval reads an interactive console.
+    Patch {
+        #[command(subcommand)]
+        action: ProposalCli,
     },
     /// Probe tool calling or run a workspace filesystem tool.
     Tools {
@@ -307,6 +347,41 @@ enum EvalCli {
         /// JSON report path. The default is target/lca-eval/tool-selection.json.
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
+    },
+    /// Run the offline agent scenarios. This command never applies a patch.
+    Agent {
+        /// Refused unless `LCA_EVAL_LIVE=1`. Live mode stays fail-closed.
+        #[arg(long)]
+        live: bool,
+        /// JSON report path. The default is target/lca-eval/agent-runs.json.
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProposalCli {
+    /// List stored proposals for this workspace.
+    List,
+    /// Show one proposal, including the diff and the confirmation line.
+    Show {
+        /// Proposal UUID.
+        id: String,
+    },
+    /// Apply one proposal after an interactive confirmation line.
+    Approve {
+        /// Proposal UUID.
+        id: String,
+    },
+    /// Mark one prepared proposal rejected.
+    Reject {
+        /// Proposal UUID.
+        id: String,
+    },
+    /// Reconcile and print one proposal state. This does not write the target.
+    Status {
+        /// Proposal UUID.
+        id: String,
     },
 }
 

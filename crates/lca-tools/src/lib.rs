@@ -19,6 +19,7 @@ mod fs_error;
 mod model;
 mod pathutil;
 mod privacy;
+mod proposal;
 
 pub use action::{
     AGENT_PROTOCOL_VERSION, ActionDocument, ActionId, ActionIdFactory, ActionSource, ActionStatus,
@@ -39,4 +40,5 @@ pub use fs::{
 pub use fs_error::FsError;
 pub use model::{ToolArguments, ToolName, ToolRequest, ToolResult};
 pub use privacy::{PrivacyPatternError, PrivacyPolicy, deny_overrides};
+pub use proposal::{ProposalStore, ProposalSummary, ProposalView};
 pub use sandbox::{ResolvedKind, ResolvedPath, WorkspaceSandbox};

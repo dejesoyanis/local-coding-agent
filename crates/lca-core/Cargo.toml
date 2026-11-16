@@ -6,6 +6,7 @@ publish = false
 description = "Domain types and the agent controllers."
 
 [dependencies]
+async-trait = "0.1"
 lca-model-runtime = { path = "../lca-model-runtime" }
 lca-tools = { path = "../lca-tools" }
 serde_json = "1"

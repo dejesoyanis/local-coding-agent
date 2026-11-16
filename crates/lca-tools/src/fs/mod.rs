@@ -20,6 +20,7 @@ pub use limits::{
 };
 pub use list::{DirectoryEntry, ListResult};
 pub use patch::{ApplyResult, ApprovalGrant, ApprovalLedger, PreparedPatch};
+pub(crate) use patch::{BoundFileId, StoredPatch, restore_prepared};
 pub use read::ReadResult;
 pub use search::{SearchMatch, SearchResult};
 

@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+mod agent_eval;
 mod bounded;
 mod dispatch;
 mod error;
@@ -18,6 +19,7 @@ mod lifecycle;
 mod task;
 mod turn;
 
+pub use agent_eval::{AgentEvalReport, evaluate_agent_runs};
 pub use bounded::{
     AgentBudgets, AgentLoopState, BoundedAgentController, LOOP_PROMPT_VERSION, LoopError,
     LoopSettings, RunReport, RunStatus, StopReason, TOOL_RESULT_CONTRACT_VERSION, TurnRecord,

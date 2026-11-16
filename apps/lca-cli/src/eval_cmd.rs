@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 use lca_config::{AgentConfig, load_from_path};
-use lca_core::{EvalExecution, EvalIdentity, EvalPlan, TurnSettings, evaluate_tool_selection};
+use lca_core::{
+    EvalExecution, EvalIdentity, EvalPlan, TurnSettings, evaluate_agent_runs,
+    evaluate_tool_selection,
+};
 use lca_model_runtime::{ProtocolPreference, RuntimeError, report};
 use lca_ollama::{HttpOllamaClient, OllamaModelRuntime, OllamaRuntimeConfig};
 use lca_tools::ToolRegistry;
@@ -127,6 +130,68 @@ fn connect(config: &AgentConfig) -> Result<OllamaModelRuntime, RuntimeError> {
         config.connect_timeout(),
         config.request_timeout(),
     ))
+}
+
+/// Arguments for `lca eval agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEvalCommand {
+    /// Configuration file. It is loaded and not used as the evaluation workspace.
+    pub config: PathBuf,
+    /// Requests a live model run. This build refuses that path.
+    pub live: bool,
+    /// Report path. `None` uses `target/lca-eval/agent-runs.json`.
+    pub output: Option<PathBuf>,
+}
+
+/// Runs the offline agent scenarios. A live request does not call the model and does not apply.
+pub fn run_agent_eval(command: &AgentEvalCommand) -> CommandOutput {
+    if let Err(error) = load_from_path(&command.config) {
+        return failure(&error.to_string());
+    }
+    if command.live {
+        let enabled = std::env::var("LCA_EVAL_LIVE").ok().as_deref() == Some("1");
+        if !enabled {
+            return failure("live agent evaluation requires LCA_EVAL_LIVE=1");
+        }
+        return failure(
+            "live agent evaluation is fail-closed: this build does not apply patches and does not call the model from an evaluation",
+        );
+    }
+    let tokio_runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return failure(&format!("failed to start the runtime: {error}")),
+    };
+    let report = match tokio_runtime.block_on(evaluate_agent_runs()) {
+        Ok(report) => report,
+        Err(error) => return failure(&error.to_string()),
+    };
+    let output = command.output.clone().unwrap_or_else(|| {
+        PathBuf::from("target")
+            .join("lca-eval")
+            .join("agent-runs.json")
+    });
+    let body = serde_json::to_string_pretty(report.to_json()).unwrap_or_else(|_| "{}".to_owned());
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return failure(&format!("failed to create the report directory: {error}"));
+    }
+    if let Err(error) = std::fs::write(&output, format!("{body}\n")) {
+        return failure(&format!("failed to write the report: {error}"));
+    }
+    let mut stdout = report.summary();
+    stdout.push_str("report: ");
+    stdout.push_str(&output.display().to_string());
+    stdout.push('\n');
+    CommandOutput {
+        exit_code: 0,
+        stdout,
+        stderr: String::new(),
+    }
 }
 
 fn failure(message: &str) -> CommandOutput {

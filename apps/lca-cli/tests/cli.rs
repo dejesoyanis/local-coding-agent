@@ -1234,3 +1234,56 @@ fn agent_execute_denies_a_protected_file_without_leaking_it() {
     assert!(!stderr.contains("SENTINEL_DO_NOT_LEAK"), "{stderr}");
     assert!(stdout.contains("stop_reason: tool_error\n"), "{stdout}");
 }
+
+#[test]
+fn patch_approve_rejects_flags_and_a_piped_line() {
+    for flag in ["--yes", "--force", "--auto-approve"] {
+        let output = run(&[
+            "patch",
+            "approve",
+            flag,
+            "00000000-0000-0000-0000-000000000001",
+        ]);
+        assert_ne!(output.status.code(), Some(0), "{flag}");
+        let stderr = text(&output.stderr);
+        assert!(!stderr.contains("applied: true"), "{stderr}");
+    }
+    let output = run(&["patch", "approve", "00000000-0000-0000-0000-000000000001"]);
+    let stderr = text(&output.stderr);
+    assert_ne!(output.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("interactive"), "{stderr}");
+}
+
+#[test]
+fn eval_agent_reports_an_offline_run_and_applies_nothing() {
+    let workspace = TempDir::new("eval-agent");
+    let (config, _) = write_valid_config(workspace.path());
+    let report = workspace.path().join("agent-runs.json");
+    let output = run(&[
+        "eval",
+        "agent",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "--output",
+        report.to_str().expect("utf-8"),
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("patches_applied: 0\n"), "{stdout}");
+    assert!(stdout.contains("prepared_patches: 1\n"), "{stdout}");
+    assert!(stdout.contains("policy_denials: 1\n"), "{stdout}");
+    let body = fs::read_to_string(&report).expect("report");
+    assert!(body.contains("\"patches_applied\": 0"), "{body}");
+    assert!(!body.contains("SENTINEL_SECRET"), "{body}");
+    let live = run(&[
+        "eval",
+        "agent",
+        "--live",
+        "--config",
+        config.to_str().expect("utf-8"),
+    ]);
+    let live_err = text(&live.stderr);
+    assert_ne!(live.status.code(), Some(0), "{live_err}");
+    assert!(live_err.contains("LCA_EVAL_LIVE"), "{live_err}");
+}

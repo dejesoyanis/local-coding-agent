@@ -7,9 +7,11 @@
 
 use std::collections::HashSet;
 use std::fmt;
+#[cfg(not(windows))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -19,10 +21,9 @@ use crate::fs::read::privacy_gate;
 use crate::fs_error::{FsError, display_path};
 use crate::pathutil::paths_equivalent;
 use crate::privacy::deny_overrides;
-use crate::sandbox::{
-    FileIdentity, WorkspaceSandbox, create_new_nofollow, file_identity, is_reparse,
-    read_resolved_file,
-};
+use crate::sandbox::{FileIdentity, WorkspaceSandbox, read_resolved_file};
+#[cfg(not(windows))]
+use crate::sandbox::{create_new_nofollow, file_identity, is_reparse};
 
 /// In-process record of approval bindings that have already been used.
 ///
@@ -67,12 +68,22 @@ impl ApprovalGrant {
     }
 }
 
+/// NTFS file id captured at prepare time. Zeros mean this platform has no file id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundFileId {
+    /// Volume serial from `FileIdInfo`.
+    pub volume_serial: u64,
+    /// 128-bit file id.
+    pub file_id: [u8; 16],
+}
+
 /// A patch that has been applied in memory and is waiting for approval.
 pub struct PreparedPatch {
     action_id: u64,
     workspace_root: PathBuf,
     relative_path: String,
     identity: FileIdentity,
+    platform: BoundFileId,
     original_hash: [u8; 32],
     new_hash: [u8; 32],
     patch_hash: [u8; 32],
@@ -138,7 +149,49 @@ impl PreparedPatch {
         self.line_ending
     }
 
-    /// Exact line the user must type to approve this action.
+    /// SHA-256 bytes of the file that was read.
+    #[must_use]
+    pub(crate) fn original_hash(&self) -> [u8; 32] {
+        self.original_hash
+    }
+
+    /// SHA-256 bytes that would be written.
+    #[must_use]
+    pub(crate) fn new_hash(&self) -> [u8; 32] {
+        self.new_hash
+    }
+
+    /// SHA-256 bytes of the unified diff text.
+    #[must_use]
+    pub(crate) fn patch_hash(&self) -> [u8; 32] {
+        self.patch_hash
+    }
+
+    /// Proposed file bytes. They are not included in [`Debug`].
+    #[must_use]
+    pub(crate) fn new_bytes(&self) -> &[u8] {
+        &self.new_bytes
+    }
+
+    /// Unified diff text that was applied in memory.
+    #[must_use]
+    pub(crate) fn patch_text(&self) -> &str {
+        &self.patch_text
+    }
+
+    /// File id captured for the verified apply.
+    #[must_use]
+    pub(crate) fn platform_id(&self) -> BoundFileId {
+        self.platform
+    }
+
+    /// Timestamp identity captured for the in-process binding.
+    #[must_use]
+    pub(crate) fn file_identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Exact line the user must type to approve this action in-process.
     #[must_use]
     pub fn confirmation_line(&self) -> String {
         format!(
@@ -208,11 +261,13 @@ pub(crate) fn prepare_patch(
     let original_hash = sha256(&original);
     let new_hash = sha256(&new_bytes);
     let patch_hash = sha256(patch.as_bytes());
+    let platform = capture_platform(resolved.absolute(), resolved.relative())?;
     let binding = compute_binding(
         action_id,
         &sandbox.root().to_string_lossy(),
         resolved.relative(),
         resolved.identity(),
+        platform,
         &original_hash,
         &new_hash,
         &patch_hash,
@@ -223,6 +278,7 @@ pub(crate) fn prepare_patch(
         workspace_root: sandbox.root().to_path_buf(),
         relative_path: resolved.relative().to_owned(),
         identity: resolved.identity(),
+        platform,
         original_hash,
         new_hash,
         patch_hash,
@@ -282,88 +338,102 @@ pub(crate) fn apply_granted(
         });
     }
 
-    let parent = resolved
-        .absolute()
-        .parent()
-        .ok_or_else(|| FsError::WriteFailed {
+    #[cfg(windows)]
+    {
+        apply_ntfs(prepared, &mut used)?;
+        Ok(ApplyResult {
             path: prepared.relative_path.clone(),
-            message: "target has no parent directory".to_owned(),
-        })?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let temp_path = parent.join(format!(
-        ".lca-apply-{}-{}-{nanos}.tmp",
-        prepared.action_id,
-        std::process::id()
-    ));
-    let mut temp = create_new_nofollow(&temp_path).map_err(|error| FsError::WriteFailed {
-        path: prepared.relative_path.clone(),
-        message: error.to_string(),
-    })?;
-    let temp_meta = temp.metadata().map_err(|error| FsError::WriteFailed {
-        path: prepared.relative_path.clone(),
-        message: error.to_string(),
-    })?;
-    if is_reparse(&temp_meta) {
-        drop(temp);
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(FsError::ReparseDenied {
-            path: prepared.relative_path.clone(),
-        });
+            new_hash: hex_encode(&prepared.new_hash),
+        })
     }
-    let mut cleanup = TempCleanup {
-        path: &temp_path,
-        armed: true,
-    };
-    temp.write_all(&prepared.new_bytes)
-        .map_err(|error| FsError::WriteFailed {
+    #[cfg(not(windows))]
+    {
+        let parent = resolved
+            .absolute()
+            .parent()
+            .ok_or_else(|| FsError::WriteFailed {
+                path: prepared.relative_path.clone(),
+                message: "target has no parent directory".to_owned(),
+            })?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let temp_path = parent.join(format!(
+            ".lca-apply-{}-{}-{nanos}.tmp",
+            prepared.action_id,
+            std::process::id()
+        ));
+        let mut temp = create_new_nofollow(&temp_path).map_err(|error| FsError::WriteFailed {
             path: prepared.relative_path.clone(),
             message: error.to_string(),
         })?;
-    temp.sync_all().map_err(|error| FsError::WriteFailed {
-        path: prepared.relative_path.clone(),
-        message: error.to_string(),
-    })?;
-    drop(temp);
-
-    let again = std::fs::symlink_metadata(resolved.absolute()).map_err(|error| FsError::Io {
-        path: prepared.relative_path.clone(),
-        message: error.to_string(),
-    })?;
-    if is_reparse(&again) || file_identity(&again, &prepared.relative_path)? != prepared.identity {
-        return Err(FsError::IdentityChanged {
+        let temp_meta = temp.metadata().map_err(|error| FsError::WriteFailed {
             path: prepared.relative_path.clone(),
-        });
-    }
-    let reread = read_capped(&resolved, &prepared.relative_path)?;
-    if sha256(&reread) != prepared.original_hash {
-        return Err(FsError::Conflict {
+            message: error.to_string(),
+        })?;
+        if is_reparse(&temp_meta) {
+            drop(temp);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(FsError::ReparseDenied {
+                path: prepared.relative_path.clone(),
+            });
+        }
+        let mut cleanup = TempCleanup {
+            path: &temp_path,
+            armed: true,
+        };
+        temp.write_all(&prepared.new_bytes)
+            .map_err(|error| FsError::WriteFailed {
+                path: prepared.relative_path.clone(),
+                message: error.to_string(),
+            })?;
+        temp.sync_all().map_err(|error| FsError::WriteFailed {
             path: prepared.relative_path.clone(),
-        });
-    }
+            message: error.to_string(),
+        })?;
+        drop(temp);
 
-    used.insert(prepared.binding);
-    std::fs::rename(&temp_path, resolved.absolute()).map_err(|error| FsError::WriteFailed {
-        path: prepared.relative_path.clone(),
-        message: error.to_string(),
-    })?;
-    cleanup.armed = false;
+        let again =
+            std::fs::symlink_metadata(resolved.absolute()).map_err(|error| FsError::Io {
+                path: prepared.relative_path.clone(),
+                message: error.to_string(),
+            })?;
+        if is_reparse(&again)
+            || file_identity(&again, &prepared.relative_path)? != prepared.identity
+        {
+            return Err(FsError::IdentityChanged {
+                path: prepared.relative_path.clone(),
+            });
+        }
+        let reread = read_capped(&resolved, &prepared.relative_path)?;
+        if sha256(&reread) != prepared.original_hash {
+            return Err(FsError::Conflict {
+                path: prepared.relative_path.clone(),
+            });
+        }
 
-    let written = sandbox.resolve(&prepared.relative_path)?;
-    let bytes = read_resolved_file(&written, READ_CAP).map_err(|_| FsError::VerifyFailed {
-        path: prepared.relative_path.clone(),
-    })?;
-    if sha256(&bytes) != prepared.new_hash {
-        return Err(FsError::VerifyFailed {
+        used.insert(prepared.binding);
+        std::fs::rename(&temp_path, resolved.absolute()).map_err(|error| FsError::WriteFailed {
             path: prepared.relative_path.clone(),
-        });
+            message: error.to_string(),
+        })?;
+        cleanup.armed = false;
+
+        let written = sandbox.resolve(&prepared.relative_path)?;
+        let bytes = read_resolved_file(&written, READ_CAP).map_err(|_| FsError::VerifyFailed {
+            path: prepared.relative_path.clone(),
+        })?;
+        if sha256(&bytes) != prepared.new_hash {
+            return Err(FsError::VerifyFailed {
+                path: prepared.relative_path.clone(),
+            });
+        }
+        Ok(ApplyResult {
+            path: prepared.relative_path.clone(),
+            new_hash: hex_encode(&prepared.new_hash),
+        })
     }
-    Ok(ApplyResult {
-        path: prepared.relative_path.clone(),
-        new_hash: hex_encode(&prepared.new_hash),
-    })
 }
 
 const READ_CAP: u64 = 16 * 1024 * 1024;
@@ -764,33 +834,199 @@ fn render_diff(path: &str, hunks: &[Hunk]) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_binding(
     action_id: u64,
     workspace: &str,
     relative: &str,
     identity: FileIdentity,
+    platform: BoundFileId,
     original_hash: &[u8; 32],
     new_hash: &[u8; 32],
     patch_hash: &[u8; 32],
 ) -> [u8; 32] {
     let mut buffer = Vec::new();
-    push_part(&mut buffer, b"LCA-01D-APPROVAL-V1");
+    push_part(&mut buffer, b"LCA-01G-APPROVAL-V2");
     push_part(&mut buffer, &action_id.to_le_bytes());
     push_part(&mut buffer, workspace.as_bytes());
     push_part(&mut buffer, relative.as_bytes());
     push_part(&mut buffer, &identity.created().to_le_bytes());
     push_part(&mut buffer, &identity.modified().to_le_bytes());
     push_part(&mut buffer, &identity.len().to_le_bytes());
+    push_part(&mut buffer, &platform.volume_serial.to_le_bytes());
+    push_part(&mut buffer, &platform.file_id);
     push_part(&mut buffer, original_hash);
     push_part(&mut buffer, new_hash);
     push_part(&mut buffer, patch_hash);
     sha256(&buffer)
 }
 
+fn capture_platform(path: &Path, relative: &str) -> Result<BoundFileId, FsError> {
+    match lca_platform::inspect(path) {
+        Ok(info) => {
+            if info.is_reparse() {
+                return Err(FsError::ReparseDenied {
+                    path: relative.to_owned(),
+                });
+            }
+            if info.file_id() == [0; 16] {
+                return Err(FsError::UnverifiableIdentity {
+                    path: relative.to_owned(),
+                });
+            }
+            if !info.is_directory() && info.link_count() != 1 {
+                return Err(FsError::HardlinkDenied {
+                    path: relative.to_owned(),
+                });
+            }
+            Ok(BoundFileId {
+                volume_serial: info.volume_serial(),
+                file_id: info.file_id(),
+            })
+        }
+        Err(lca_platform::PlatformError::Unsupported) => Ok(BoundFileId {
+            volume_serial: 0,
+            file_id: [0; 16],
+        }),
+        Err(error) => Err(FsError::Io {
+            path: relative.to_owned(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn apply_ntfs(
+    prepared: &PreparedPatch,
+    used: &mut std::collections::HashSet<[u8; 32]>,
+) -> Result<(), FsError> {
+    if prepared.platform.file_id == [0; 16] {
+        return Err(FsError::UnverifiableIdentity {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    let components: Vec<String> = prepared
+        .relative_path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect();
+    let mut opened = lca_platform::open_tree(&prepared.workspace_root, &components)
+        .map_err(|error| map_platform(&prepared.relative_path, error))?;
+    let info = opened.info();
+    if info.volume_serial() != prepared.platform.volume_serial
+        || info.file_id() != prepared.platform.file_id
+    {
+        return Err(FsError::IdentityChanged {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    if info.is_reparse() {
+        return Err(FsError::ReparseDenied {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    if info.link_count() != 1 {
+        return Err(FsError::HardlinkDenied {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    let current = opened
+        .read(READ_CAP)
+        .map_err(|error| map_platform(&prepared.relative_path, error))?;
+    if sha256(&current) != prepared.original_hash {
+        return Err(FsError::Conflict {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    used.insert(prepared.binding);
+    let readback = opened
+        .replace_with(&prepared.new_bytes)
+        .map_err(|error| map_platform(&prepared.relative_path, error))?;
+    if sha256(&readback) != prepared.new_hash {
+        return Err(FsError::VerifyFailed {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn map_platform(path: &str, error: lca_platform::PlatformError) -> FsError {
+    match error {
+        lca_platform::PlatformError::Unsupported => FsError::UnsupportedPlatform,
+        lca_platform::PlatformError::Reparse => FsError::ReparseDenied {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Hardlink => FsError::HardlinkDenied {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Identity => FsError::IdentityChanged {
+            path: path.to_owned(),
+        },
+        lca_platform::PlatformError::Sharing => FsError::WriteFailed {
+            path: path.to_owned(),
+            message: "target file is busy".to_owned(),
+        },
+        lca_platform::PlatformError::Acl => FsError::StoreUnavailable {
+            message: "directory ACL is not restricted".to_owned(),
+        },
+        lca_platform::PlatformError::Protect => FsError::ProposalInvalid {
+            message: "local protection check failed".to_owned(),
+        },
+        lca_platform::PlatformError::Io(message) => FsError::WriteFailed {
+            path: path.to_owned(),
+            message,
+        },
+    }
+}
+
 fn push_part(buffer: &mut Vec<u8>, part: &[u8]) {
     let len = u64::try_from(part.len()).unwrap_or(u64::MAX);
     buffer.extend_from_slice(&len.to_le_bytes());
     buffer.extend_from_slice(part);
+}
+
+pub(crate) fn restore_prepared(stored: StoredPatch) -> PreparedPatch {
+    let binding = compute_binding(
+        stored.action_id,
+        &stored.workspace_root.to_string_lossy(),
+        &stored.relative_path,
+        stored.identity,
+        stored.platform,
+        &stored.original_hash,
+        &stored.new_hash,
+        &stored.patch_hash,
+    );
+    PreparedPatch {
+        action_id: stored.action_id,
+        workspace_root: stored.workspace_root,
+        relative_path: stored.relative_path,
+        identity: stored.identity,
+        platform: stored.platform,
+        original_hash: stored.original_hash,
+        new_hash: stored.new_hash,
+        patch_hash: stored.patch_hash,
+        new_bytes: stored.new_bytes,
+        patch_text: stored.patch_text,
+        diff: stored.diff,
+        binding,
+        line_ending: stored.line_ending,
+    }
+}
+
+pub(crate) struct StoredPatch {
+    pub action_id: u64,
+    pub workspace_root: PathBuf,
+    pub relative_path: String,
+    pub identity: FileIdentity,
+    pub platform: BoundFileId,
+    pub original_hash: [u8; 32],
+    pub new_hash: [u8; 32],
+    pub patch_hash: [u8; 32],
+    pub new_bytes: Vec<u8>,
+    pub patch_text: String,
+    pub diff: String,
+    pub line_ending: &'static str,
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -807,6 +1043,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 struct TempCleanup<'a> {
     path: &'a Path,
     armed: bool,

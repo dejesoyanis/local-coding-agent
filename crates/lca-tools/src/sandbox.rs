@@ -37,6 +37,15 @@ pub(crate) struct FileIdentity {
 
 impl FileIdentity {
     #[must_use]
+    pub(crate) const fn from_parts(created: u64, modified: u64, len: u64) -> Self {
+        Self {
+            created,
+            modified,
+            len,
+        }
+    }
+
+    #[must_use]
     pub(crate) const fn created(self) -> u64 {
         self.created
     }
@@ -482,6 +491,7 @@ pub(crate) fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
 }
 
 /// Creates a new file. Fails if the name already exists, including as a reparse point.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn create_new_nofollow(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
