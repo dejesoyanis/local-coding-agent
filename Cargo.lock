@@ -737,6 +737,7 @@ dependencies = [
 name = "lca-config"
 version = "0.1.0"
 dependencies = [
+ "lca-tools",
  "serde",
  "thiserror",
  "toml",

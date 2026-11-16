@@ -11,10 +11,10 @@ use lca_config::{AgentConfig, load_from_path};
 use lca_core::{ExecutedAction, SingleTurnAgentController, TurnError, TurnReport, TurnSettings};
 use lca_model_runtime::{ProtocolPreference, RuntimeError, report};
 use lca_ollama::{OllamaModelRuntime, OllamaRuntimeConfig};
-use lca_tools::{FsOutcome, ToolRegistry, WorkspaceSandbox};
+use lca_tools::{FsOutcome, ToolRegistry};
 
 use crate::CommandOutput;
-use crate::tools_cmd::limits_from;
+use crate::tools_cmd::{limits_from, sandbox_from};
 
 /// Arguments for `lca agent run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,9 +40,9 @@ pub fn run_agent(command: &AgentCommand) -> CommandOutput {
         Ok(runtime) => runtime,
         Err(error) => return failure(&report(&error)),
     };
-    let sandbox = match WorkspaceSandbox::new(config.workspace_root()) {
+    let sandbox = match sandbox_from(&config) {
         Ok(sandbox) => sandbox,
-        Err(error) => return failure(&error.to_string()),
+        Err(error) => return failure(&error),
     };
     let limits = match limits_from(&config) {
         Ok(limits) => limits,
@@ -98,6 +98,14 @@ fn render_report(report: &TurnReport) -> CommandOutput {
         report.model_calls(),
         report.actions().len(),
     );
+    push(
+        &mut stdout,
+        "response_class",
+        report.response_class().as_str(),
+    );
+    if let Some(diagnostic) = report.diagnostic() {
+        push(&mut stdout, "diagnostic", diagnostic);
+    };
     for action in report.actions() {
         render_action(&mut stdout, action);
     }

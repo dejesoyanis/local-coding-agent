@@ -15,8 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::fs::limits::FsLimits;
+use crate::fs::read::privacy_gate;
 use crate::fs_error::{FsError, display_path};
 use crate::pathutil::paths_equivalent;
+use crate::privacy::deny_overrides;
 use crate::sandbox::{
     FileIdentity, WorkspaceSandbox, create_new_nofollow, file_identity, is_reparse,
     read_resolved_file,
@@ -179,7 +181,8 @@ pub(crate) fn prepare_patch(
             message: "patch path does not match the requested path".to_owned(),
         });
     }
-    let resolved = sandbox.resolve(path)?;
+    let resolved = sandbox.resolve_visible(path)?;
+    deny_overrides(&[privacy_gate(sandbox, resolved.relative())])?;
     if !resolved.is_file() {
         return Err(FsError::NotAFile {
             path: display_path(path),
@@ -246,6 +249,7 @@ pub(crate) fn apply_granted(
     if !paths_equivalent(sandbox.root(), &prepared.workspace_root) {
         return Err(FsError::ApprovalMismatch);
     }
+    deny_overrides(&[privacy_gate(sandbox, &prepared.relative_path)])?;
     let mut used = ledger.used.lock().map_err(|_| FsError::LedgerUnavailable)?;
     if used.contains(&prepared.binding) {
         return Err(FsError::ApprovalConsumed);

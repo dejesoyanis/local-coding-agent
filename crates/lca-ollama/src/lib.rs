@@ -21,7 +21,9 @@ mod ndjson;
 mod runtime;
 
 pub use client::{HttpOllamaClient, OllamaClient};
-pub use dto::{RemoteModel, TagsResponse, VersionResponse, model_is_present, names_match};
+pub use dto::{
+    ModelIdentity, RemoteModel, TagsResponse, VersionResponse, model_is_present, names_match,
+};
 pub use error::{OllamaAvailability, OllamaError};
 pub use ndjson::MAX_STREAM_FRAME_BYTES;
 pub use runtime::{OllamaModelRuntime, OllamaRuntimeConfig};

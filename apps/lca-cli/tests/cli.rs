@@ -879,11 +879,86 @@ fn agent_run_rejects_an_empty_prompt_and_an_unknown_protocol() {
     assert!(stderr.contains("prompt must not be empty"), "{stderr}");
     assert!(text(&empty.stdout).is_empty());
 
-    let unknown = run(&["agent", "run", "--protocol", "yaml", "hello"]);
+    let unknown = run(&[
+        "agent",
+        "run",
+        "--protocol",
+        "yaml",
+        "--config",
+        config,
+        "hello",
+    ]);
     let combined = format!("{}{}", text(&unknown.stdout), text(&unknown.stderr));
     assert_eq!(unknown.status.code(), Some(2), "{combined}");
     assert!(
         combined.to_ascii_lowercase().contains("protocol"),
         "{combined}"
+    );
+}
+
+#[test]
+fn eval_tools_writes_a_read_only_report_and_does_not_leak_protected_bytes() {
+    let workspace = TempDir::new("eval");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .expect("cargo");
+    fs::create_dir(workspace.path().join("crates")).expect("crates");
+    fs::write(
+        workspace.path().join("crates").join("lib.rs"),
+        "pub struct ModelRuntime;\n",
+    )
+    .expect("lib");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let chat = chat_response("hello", &[]);
+    let version = r#"{"version":"0.0.0-test"}"#;
+    let tags = r#"{"models":[{"name":"lca-30b-agent:latest","digest":"sha256:abc"}]}"#;
+    let mut routes = Vec::new();
+    for _ in 0..4 {
+        routes.push(("GET /api/version", 200, version));
+        routes.push(("GET /api/tags", 200, tags));
+        routes.push(("POST /api/show", 200, show));
+        routes.push(("POST /api/chat", 200, chat.as_str()));
+    }
+    let (endpoint, _captured) = serve_routes(&routes);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    fs::write(workspace.path().join(".env"), "SENTINEL_DO_NOT_LEAK\n").expect("env");
+    let report_path = workspace.path().join("eval-report.json");
+    let output = run(&[
+        "eval",
+        "tools",
+        "--runs",
+        "1",
+        "--protocol",
+        "native",
+        "--output",
+        report_path.to_str().expect("utf-8 report"),
+        "--config",
+        config.to_str().expect("utf-8"),
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("execution: live\n"), "{stdout}");
+    assert!(stdout.contains("write_enabled: false\n"), "{stdout}");
+    assert!(
+        stdout.contains("prompt_version: lca-01e-h1.1\n"),
+        "{stdout}"
+    );
+    let report = fs::read_to_string(&report_path).expect("report");
+    assert!(report.contains("\"execution\": \"live\""), "{report}");
+    assert!(report.contains("\"write_enabled\": false"), "{report}");
+    assert!(report.contains("sha256:abc"), "{report}");
+    assert!(!report.contains("SENTINEL_DO_NOT_LEAK"), "{report}");
+    assert!(!stdout.contains("SENTINEL_DO_NOT_LEAK"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("notes.txt")).expect("notes"),
+        "alpha\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".env")).expect("env"),
+        "SENTINEL_DO_NOT_LEAK\n"
     );
 }

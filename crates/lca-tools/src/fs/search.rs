@@ -1,7 +1,9 @@
 //! Literal text search. Regular expressions are not evaluated.
 
 use crate::fs::limits::{FsLimits, MAX_DIRECTORY_SCAN};
+use crate::fs::read::{privacy_gate, read_gate};
 use crate::fs_error::{FsError, display_path};
+use crate::privacy::deny_overrides;
 use crate::sandbox::{WorkspaceSandbox, is_reparse, read_resolved_file};
 
 const EXCLUDED_DIRECTORIES: &[&str] = &[".git", "target", "node_modules"];
@@ -37,11 +39,7 @@ pub(crate) fn search_files(
     query: &str,
     path: &str,
 ) -> Result<SearchResult, FsError> {
-    if !limits.read_enabled() {
-        return Err(FsError::ToolDisabled {
-            tool: "search_files".to_owned(),
-        });
-    }
+    deny_overrides(&[read_gate(limits, "search_files")])?;
     if query.is_empty() || query.chars().count() > 1024 {
         return Err(FsError::InvalidArguments {
             message: "search query length is not allowed".to_owned(),
@@ -52,7 +50,8 @@ pub(crate) fn search_files(
             message: "search query contains a control character".to_owned(),
         });
     }
-    let resolved = sandbox.resolve(path)?;
+    let resolved = sandbox.resolve_visible(path)?;
+    deny_overrides(&[privacy_gate(sandbox, resolved.relative())])?;
     if !resolved.is_dir() {
         return Err(FsError::NotADirectory {
             path: display_path(path),
@@ -97,13 +96,14 @@ fn visit(
     if state.truncated {
         return Ok(());
     }
-    let resolved = sandbox.resolve(directory)?;
+    let resolved = sandbox.resolve_visible(directory)?;
     if !resolved.is_dir() {
         return Err(FsError::NotADirectory {
             path: directory.to_owned(),
         });
     }
     let mut names = Vec::new();
+    let mut seen = 0usize;
     let reader = std::fs::read_dir(resolved.absolute()).map_err(|error| FsError::Io {
         path: directory.to_owned(),
         message: error.to_string(),
@@ -113,7 +113,8 @@ fn visit(
             path: directory.to_owned(),
             message: error.to_string(),
         })?;
-        if names.len() == MAX_DIRECTORY_SCAN {
+        seen += 1;
+        if seen > MAX_DIRECTORY_SCAN {
             state.truncated = true;
             return Ok(());
         }
@@ -122,6 +123,14 @@ fn visit(
             continue;
         };
         if name == "." || name == ".." || !safe_name(&name) {
+            continue;
+        }
+        let child = if directory == "." {
+            name.clone()
+        } else {
+            format!("{directory}/{name}")
+        };
+        if sandbox.privacy().blocks(&child) {
             continue;
         }
         names.push(name);
@@ -171,6 +180,9 @@ fn scan_file(
     query: &str,
     state: &mut Walk,
 ) -> Result<(), FsError> {
+    if sandbox.privacy().blocks(path) {
+        return Ok(());
+    }
     if state.files_scanned >= limits.max_search_files()
         || state.bytes_read.saturating_add(len) > limits.max_search_total_bytes()
     {

@@ -123,6 +123,13 @@ pub enum FsError {
         path: String,
     },
 
+    /// A privacy rule rejected the path before its contents were read.
+    ///
+    /// The message does not include the path or any file bytes. The caller already
+    /// supplied the path. Listings omit the name instead of returning this error.
+    #[error("access to a protected workspace path was denied")]
+    PrivacyDenied,
+
     /// Search was aimed at `target`, `.git`, or `node_modules`.
     #[error("path {path} is excluded from search")]
     ExcludedPath {
@@ -253,6 +260,7 @@ impl FsError {
             Self::IdentityChanged { .. } => "identity_changed",
             Self::UnverifiableIdentity { .. } => "unverifiable_identity",
             Self::ProtectedPath { .. } => "protected_path",
+            Self::PrivacyDenied => "privacy_denied",
             Self::ExcludedPath { .. } => "excluded_path",
             Self::ToolDisabled { .. } => "tool_disabled",
             Self::InvalidArguments { .. } => "invalid_arguments",

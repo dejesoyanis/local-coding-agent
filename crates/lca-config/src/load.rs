@@ -351,6 +351,40 @@ mod tests {
         assert_eq!(config.tool_max_search_matches(), 4);
         assert_eq!(config.tool_max_search_files(), 5);
         assert_eq!(config.tool_max_search_total_bytes(), 256);
+        assert!(config.privacy_excludes().is_empty());
+    }
+
+    #[test]
+    fn privacy_excludes_are_additive_and_invalid_patterns_fail_closed() {
+        let root = TempDir::new("privacy");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let base = toml_path(&workspace);
+        let accepted = write_config(
+            root.path(),
+            &format!(
+                "workspace_root = '{base}'\n[tools]\nprivacy_excludes = ['notes/*.secret', 'private/**']\n"
+            ),
+        );
+        let config = load_from_path(&accepted).expect("patterns");
+        assert_eq!(config.privacy_excludes(), ["notes/*.secret", "private/**"]);
+        assert!(config.require_write_approval());
+
+        let rejected = write_config(
+            root.path(),
+            &format!("workspace_root = '{base}'\n[tools]\nprivacy_excludes = ['../secrets']\n"),
+        );
+        let error = load_from_path(&rejected).expect_err("pattern");
+        assert_eq!(error.kind(), "invalid_value");
+
+        let disabled = write_config(
+            root.path(),
+            &format!("workspace_root = '{base}'\n[tools]\nprivacy_enabled = false\n"),
+        );
+        assert_eq!(
+            load_from_path(&disabled).expect_err("baseline").kind(),
+            "parse"
+        );
     }
 
     #[test]

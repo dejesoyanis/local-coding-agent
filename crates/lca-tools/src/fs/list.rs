@@ -1,7 +1,9 @@
 //! Non-recursive directory listing inside the sandbox.
 
 use crate::fs::limits::{FsLimits, MAX_DIRECTORY_SCAN};
+use crate::fs::read::{privacy_gate, read_gate};
 use crate::fs_error::{FsError, display_path};
+use crate::privacy::deny_overrides;
 use crate::sandbox::{WorkspaceSandbox, is_reparse};
 
 /// One directory entry. `kind` is `file`, `directory`, `reparse`, or `error`.
@@ -35,12 +37,9 @@ pub(crate) fn list_directory(
     limits: &FsLimits,
     path: &str,
 ) -> Result<ListResult, FsError> {
-    if !limits.read_enabled() {
-        return Err(FsError::ToolDisabled {
-            tool: "list_directory".to_owned(),
-        });
-    }
-    let resolved = sandbox.resolve(path)?;
+    deny_overrides(&[read_gate(limits, "list_directory")])?;
+    let resolved = sandbox.resolve_visible(path)?;
+    deny_overrides(&[privacy_gate(sandbox, resolved.relative())])?;
     if !resolved.is_dir() {
         return Err(FsError::NotADirectory {
             path: display_path(path),
@@ -48,6 +47,7 @@ pub(crate) fn list_directory(
     }
     let before = resolved.identity();
     let mut raw_entries = Vec::new();
+    let mut seen = 0usize;
     let reader = std::fs::read_dir(resolved.absolute()).map_err(|error| FsError::Io {
         path: resolved.relative().to_owned(),
         message: error.to_string(),
@@ -57,10 +57,17 @@ pub(crate) fn list_directory(
             path: resolved.relative().to_owned(),
             message: error.to_string(),
         })?;
-        if raw_entries.len() == MAX_DIRECTORY_SCAN {
+        seen += 1;
+        if seen > MAX_DIRECTORY_SCAN {
             return Err(FsError::LimitExceeded {
                 message: "directory is too large to list deterministically".to_owned(),
             });
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            let child = child_relative(resolved.relative(), name);
+            if sandbox.privacy().blocks(&child) {
+                continue;
+            }
         }
         raw_entries.push(entry);
     }

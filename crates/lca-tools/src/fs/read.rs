@@ -2,6 +2,7 @@
 
 use crate::fs::limits::FsLimits;
 use crate::fs_error::{FsError, display_path};
+use crate::privacy::deny_overrides;
 use crate::sandbox::{WorkspaceSandbox, read_resolved_file};
 
 /// Bytes from one text file. A truncated result is a prefix, not the whole file.
@@ -22,12 +23,9 @@ pub(crate) fn read_file(
     limits: &FsLimits,
     path: &str,
 ) -> Result<ReadResult, FsError> {
-    if !limits.read_enabled() {
-        return Err(FsError::ToolDisabled {
-            tool: "read_file".to_owned(),
-        });
-    }
-    let resolved = sandbox.resolve(path)?;
+    deny_overrides(&[read_gate(limits, "read_file")])?;
+    let resolved = sandbox.resolve_visible(path)?;
+    deny_overrides(&[privacy_gate(sandbox, resolved.relative())])?;
     if !resolved.is_file() {
         return Err(FsError::NotAFile {
             path: display_path(path),
@@ -62,4 +60,22 @@ pub(crate) fn read_file(
         truncated: false,
         file_bytes,
     })
+}
+
+pub(crate) fn read_gate(limits: &FsLimits, tool: &'static str) -> Result<(), FsError> {
+    if limits.read_enabled() {
+        Ok(())
+    } else {
+        Err(FsError::ToolDisabled {
+            tool: tool.to_owned(),
+        })
+    }
+}
+
+pub(crate) fn privacy_gate(sandbox: &WorkspaceSandbox, relative: &str) -> Result<(), FsError> {
+    if sandbox.privacy().blocks(relative) {
+        Err(FsError::PrivacyDenied)
+    } else {
+        Ok(())
+    }
 }

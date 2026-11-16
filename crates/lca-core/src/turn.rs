@@ -26,13 +26,56 @@ use crate::task::AgentTask;
 
 const JSON_FALLBACK_ALLOWED: bool = true;
 
+/// Version of the single-turn system instructions.
+///
+/// Bump this when [`NATIVE_SYSTEM`] or the JSON system text changes. It is recorded
+/// by the reliability evaluation and is not a security control.
+pub const PROMPT_VERSION: &str = "lca-01e-h1.1";
+
 const NATIVE_SYSTEM: &str = "\
 You are a local coding agent running one turn. \
-Call only the tools attached to this request. \
-A tool call written as prose, markdown, or a textual marker is not executed. \
+Native tools are called only through the tool interface attached to this request. \
+Do not write a tool call as XML, Markdown, or pseudocode. Text that looks like a call is not executed. \
+Do not call a tool only because it is available. \
+Workspace tools are only for information that is actually in this project. \
+A general knowledge question does not need a workspace tool. Answer it in ordinary text. \
+You may answer with ordinary text and no tool call. \
 An approval-required tool prepares a change and does not write a file. \
 You cannot approve a write. \
-Use ordinary text when no tool is required.";
+This turn ends after your response.";
+
+const PSEUDO_DIAGNOSTIC: &str = "text matched a conservative tool-call marker and was not executed";
+const INVALID_NATIVE_DIAGNOSTIC: &str =
+    "native response was not a structured tool call and was not executed";
+
+/// How a native response was shaped. This does not grant execution.
+///
+/// Marker detection is a conservative scan for a few literal strings. It is not a
+/// parser and it does not recognize every way a model can describe a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseClass {
+    /// `tool_calls` contained at least one structured call.
+    NativeToolCall,
+    /// Assistant text with no structured call and no recognized marker.
+    PlainText,
+    /// Assistant text contained a literal tool-call marker and no structured call.
+    PseudoToolCallText,
+    /// The whole assistant text was JSON shaped like a tool payload, with no structured call.
+    InvalidNativeResponse,
+}
+
+impl ResponseClass {
+    /// Stable name used in diagnostics and evaluation reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeToolCall => "native_tool_call",
+            Self::PlainText => "plain_text",
+            Self::PseudoToolCallText => "pseudo_tool_call_text",
+            Self::InvalidNativeResponse => "invalid_native_response",
+        }
+    }
+}
 
 /// Settings for one `agent run`.
 ///
@@ -115,6 +158,8 @@ pub struct TurnReport {
     text: String,
     actions: Vec<ExecutedAction>,
     model_calls: u32,
+    response_class: ResponseClass,
+    diagnostic: Option<&'static str>,
 }
 
 impl TurnReport {
@@ -140,6 +185,18 @@ impl TurnReport {
     #[must_use]
     pub const fn model_calls(&self) -> u32 {
         self.model_calls
+    }
+
+    /// Diagnostic shape of the model response. It does not authorize a tool.
+    #[must_use]
+    pub const fn response_class(&self) -> ResponseClass {
+        self.response_class
+    }
+
+    /// Short hint for a pseudo or invalid native response. `None` for an ordinary result.
+    #[must_use]
+    pub const fn diagnostic(&self) -> Option<&str> {
+        self.diagnostic
     }
 }
 
@@ -308,6 +365,7 @@ impl SingleTurnAgentController {
             Ok(response) => response,
             Err(error) => return Err(fail(&mut task, now, error)),
         };
+        let (response_class, diagnostic) = classify_response(protocol, &response);
         let calls = match proposed_calls(protocol, &response) {
             Ok(calls) => calls,
             Err(error) => return Err(fail(&mut task, now, error)),
@@ -345,6 +403,8 @@ impl SingleTurnAgentController {
             text: response.text().to_owned(),
             actions,
             model_calls,
+            response_class,
+            diagnostic,
         })
     }
 
@@ -507,8 +567,13 @@ Use protocol_version 1. \
 The object may contain only protocol_version and actions. \
 Each action may contain only tool and arguments. \
 Do not use markdown. Do not invent tools. Do not add fields. \
+Do not call a tool only because it is listed. \
+Workspace tools are only for information that is actually in this project. \
+A general knowledge question uses an empty actions array. \
+If no tool is required, return protocol_version 1 and an empty actions array. \
 An approval-required tool prepares a change and does not write. \
-You cannot approve a write.\n\
+You cannot approve a write. \
+This turn ends after your response.\n\
 Tools: {catalog_json}"
     );
     if system.chars().count() > lca_model_runtime::MAX_MESSAGE_CHARS {
@@ -537,6 +602,78 @@ fn proposed_calls(
                 .collect())
         }
     }
+}
+
+/// Classifies a response for diagnostics.
+///
+/// Native execution still uses only [`GenerationResponse::tool_calls`]. JSON execution
+/// still uses only [`parse_action_document`]. This function does not change either path.
+#[must_use]
+pub fn classify_response(
+    protocol: SelectedProtocol,
+    response: &GenerationResponse,
+) -> (ResponseClass, Option<&'static str>) {
+    match protocol {
+        SelectedProtocol::Native => classify_native(response),
+        SelectedProtocol::StructuredJson { .. } => {
+            if looks_like_pseudo_tool_call(response.text()) {
+                (ResponseClass::PseudoToolCallText, Some(PSEUDO_DIAGNOSTIC))
+            } else {
+                (ResponseClass::PlainText, None)
+            }
+        }
+    }
+}
+
+fn classify_native(response: &GenerationResponse) -> (ResponseClass, Option<&'static str>) {
+    if !response.tool_calls().is_empty() {
+        return (ResponseClass::NativeToolCall, None);
+    }
+    if looks_like_pseudo_tool_call(response.text()) {
+        return (ResponseClass::PseudoToolCallText, Some(PSEUDO_DIAGNOSTIC));
+    }
+    if json_tool_shape(response.text()) {
+        return (
+            ResponseClass::InvalidNativeResponse,
+            Some(INVALID_NATIVE_DIAGNOSTIC),
+        );
+    }
+    (ResponseClass::PlainText, None)
+}
+
+fn looks_like_pseudo_tool_call(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("<tool_call")
+        || lower.contains("</tool_call>")
+        || lower.contains("<function=")
+        || lower.contains("<parameter=")
+}
+
+fn json_tool_shape(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 * 1024 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    match value {
+        Value::Object(map) => object_is_toolish(&map),
+        Value::Array(items) => items.iter().any(|item| {
+            item.as_object()
+                .is_some_and(|map| map.contains_key("tool") || map.contains_key("function"))
+        }),
+        _ => false,
+    }
+}
+
+fn object_is_toolish(map: &serde_json::Map<String, Value>) -> bool {
+    map.contains_key("tool")
+        || map.contains_key("tool_calls")
+        || map.contains_key("actions")
+        || map.contains_key("function")
+        || map.contains_key("protocol_version")
+        || (map.contains_key("name") && map.contains_key("arguments"))
 }
 
 fn source_of(protocol: SelectedProtocol) -> ActionSource {
@@ -1243,5 +1380,132 @@ mod tests {
         };
         assert!(file.content.contains("fn main"));
         assert_eq!(agent.generations(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_asks_for_the_tool_interface_and_plain_answers() {
+        let root = TempDir::new();
+        let runtime = mock(
+            CapabilityStatus::Confirmed,
+            CapabilityStatus::Unknown,
+            response(
+                Vec::new(),
+                "Ownership ist ein Regelwerk. Borrowing ist die zweite Regel.",
+            ),
+        );
+        let agent = controller(&root.0, ProtocolPreference::Native, 8, true, true);
+        let report = agent
+            .run(&runtime, "Erkläre Rust Ownership in zwei Sätzen.", now())
+            .await
+            .expect("text");
+        assert_eq!(report.response_class(), ResponseClass::PlainText);
+        assert!(report.actions().is_empty());
+        assert!(report.diagnostic().is_none());
+        assert_one_turn(&runtime);
+        let request = request_of(&runtime);
+        let system = request.system().expect("system").to_owned();
+        for phrase in [
+            "tool interface attached to this request",
+            "Do not write a tool call as XML, Markdown, or pseudocode",
+            "only because it is available",
+            "general knowledge question does not need a workspace tool",
+            "ordinary text",
+            "This turn ends after your response",
+        ] {
+            assert!(system.contains(phrase), "{phrase} missing in {system}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pseudo_tool_call_text_is_not_executed_and_is_not_retried() {
+        let root = TempDir::new();
+        std::fs::write(root.0.join("secret.txt"), "SENTINEL_DO_NOT_LEAK").expect("secret");
+        let text = "\
+<function=search_files>
+<parameter=path>
+crates
+</parameter>
+<parameter=query>
+ModelRuntime
+</parameter>
+</function>
+</tool_call>";
+        let runtime = mock(
+            CapabilityStatus::Confirmed,
+            CapabilityStatus::Confirmed,
+            response(Vec::new(), text),
+        );
+        let agent = controller(&root.0, ProtocolPreference::Native, 8, true, true);
+        let report = agent
+            .run(
+                &runtime,
+                "Suche im Verzeichnis crates nach ModelRuntime.",
+                now(),
+            )
+            .await
+            .expect("text");
+        assert_one_turn(&runtime);
+        assert!(report.actions().is_empty());
+        assert_eq!(report.response_class(), ResponseClass::PseudoToolCallText);
+        assert!(report.diagnostic().is_some());
+        assert!(!report.text().contains("SENTINEL_DO_NOT_LEAK"));
+        let second = agent
+            .run(&runtime, "again", now())
+            .await
+            .expect_err("second");
+        assert_eq!(second.kind(), "second_model_turn");
+        assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn json_in_native_mode_is_classified_and_not_executed() {
+        let root = TempDir::new();
+        std::fs::write(root.0.join("secret.txt"), "SENTINEL_DO_NOT_LEAK").expect("secret");
+        let document = r#"{"protocol_version":1,"actions":[{"tool":"read_file","arguments":{"path":"secret.txt"}}]}"#;
+        let runtime = mock(
+            CapabilityStatus::Confirmed,
+            CapabilityStatus::Confirmed,
+            response(Vec::new(), document),
+        );
+        let agent = controller(&root.0, ProtocolPreference::Native, 8, true, true);
+        let report = agent
+            .run(&runtime, "Lies secret.txt", now())
+            .await
+            .expect("text");
+        assert!(report.actions().is_empty());
+        assert_eq!(
+            report.response_class(),
+            ResponseClass::InvalidNativeResponse
+        );
+        assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
+        assert!(!report.text().contains("SENTINEL_DO_NOT_LEAK"));
+    }
+
+    #[tokio::test]
+    async fn a_structured_read_of_lca_toml_is_denied_without_leaking_bytes() {
+        let root = TempDir::new();
+        std::fs::write(root.0.join("lca.toml"), "SENTINEL_DO_NOT_LEAK\n").expect("secret");
+        std::fs::write(root.0.join("Cargo.toml"), "[package]\n").expect("cargo");
+        let runtime = mock(
+            CapabilityStatus::Confirmed,
+            CapabilityStatus::Unknown,
+            response(vec![read_call("lca.toml")], ""),
+        );
+        let agent = controller(&root.0, ProtocolPreference::Native, 8, true, true);
+        let error = agent
+            .run(&runtime, "Lies lca.toml.", now())
+            .await
+            .expect_err("denied");
+        assert_eq!(error.kind(), "privacy_denied");
+        assert!(!error.to_string().contains("SENTINEL_DO_NOT_LEAK"));
+        assert!(error.prior_actions().is_empty());
+        assert_one_turn(&runtime);
+        let second = agent
+            .run(&runtime, "retry", now())
+            .await
+            .expect_err("second");
+        assert_eq!(second.kind(), "second_model_turn");
+        assert_eq!(runtime.generate_calls.load(Ordering::SeqCst), 1);
     }
 }

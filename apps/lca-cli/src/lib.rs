@@ -13,6 +13,7 @@
 
 mod agent;
 mod ask;
+mod eval_cmd;
 mod probe;
 mod tools_cmd;
 
@@ -114,6 +115,19 @@ where
             protocol: protocol.preference(),
             prompt,
         })),
+        Command::Eval {
+            action:
+                EvalCli::Tools {
+                    runs,
+                    protocol,
+                    output,
+                },
+        } => Invocation::Buffered(eval_cmd::run_eval(&eval_cmd::EvalCommand {
+            config: config_path,
+            protocol: protocol.preference(),
+            runs,
+            output,
+        })),
         Command::Tools { action } => match action {
             ToolsAction::Probe { protocol } => {
                 Invocation::Buffered(probe::run_probe(&probe::ProbeCommand {
@@ -202,6 +216,11 @@ enum Command {
         #[command(subcommand)]
         action: AgentCli,
     },
+    /// Measure tool selection. Samples are read-only.
+    Eval {
+        #[command(subcommand)]
+        action: EvalCli,
+    },
     /// Stream an answer from the configured local model.
     Ask {
         /// Model name. Overrides the configuration file for this call.
@@ -228,6 +247,22 @@ enum AgentCli {
         /// Task for the model.
         #[arg(value_name = "PROMPT")]
         prompt: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCli {
+    /// Repeat the read-only tool-selection cases and write a JSON report.
+    Tools {
+        /// Independent samples per case, from 1 through 100.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+        /// `native`, `json`, or `auto`. The default is `native`.
+        #[arg(long, value_enum, default_value = "native")]
+        protocol: CliProtocol,
+        /// JSON report path. The default is target/lca-eval/tool-selection.json.
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
     },
 }
 

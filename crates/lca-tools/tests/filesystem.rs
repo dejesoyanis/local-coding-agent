@@ -9,8 +9,8 @@ use proptest::prelude::*;
 
 use lca_tools::{
     ActionIdFactory, ActionSource, ApprovalGrant, ApprovalLedger, FsError, FsLimitValues, FsLimits,
-    FsOutcome, ToolRegistry, WorkspaceSandbox, apply_granted, execute_validated, propose_actions,
-    validate_batch,
+    FsOutcome, PrivacyPolicy, ToolRegistry, WorkspaceSandbox, apply_granted, execute_validated,
+    propose_actions, validate_batch,
 };
 use serde_json::{Value, json};
 
@@ -731,6 +731,241 @@ fn an_exclusive_lock_blocks_the_write_without_changing_bytes() {
         std::fs::read_to_string(&file).expect("unchanged"),
         "alpha\n"
     );
+}
+
+#[test]
+fn privacy_policy_hides_and_denies_protected_paths() {
+    let root = TempDir::new("privacy");
+    let sandbox = WorkspaceSandbox::new(root.path()).expect("sandbox");
+    std::fs::create_dir_all(root.path().join("nested").join("src")).expect("nested");
+    std::fs::create_dir_all(root.path().join("certs")).expect("certs");
+    write(&root.path().join("lca.toml"), "SENTINEL_LCA\n");
+    write(&root.path().join("opencode.json"), "SENTINEL_OPEN\n");
+    write(&root.path().join(".env"), "SENTINEL_ENV\n");
+    write(&root.path().join(".env.local"), "SENTINEL_LOCAL\n");
+    write(&root.path().join(".env.example"), "TEMPLATE\n");
+    write(&root.path().join("id_rsa"), "SENTINEL_KEY\n");
+    write(
+        &root.path().join("certs").join("server.pem"),
+        "SENTINEL_PEM\n",
+    );
+    write(&root.path().join("credentials.json"), "SENTINEL_CRED\n");
+    write(&root.path().join("secrets.toml"), "SENTINEL_SECRETS\n");
+    write(
+        &root.path().join("nested").join("src").join("main.rs"),
+        "fn main() {}\n",
+    );
+    write(
+        &root.path().join("nested").join("lca.toml"),
+        "SENTINEL_NESTED\n",
+    );
+    write(&root.path().join("Cargo.toml"), "[package]\n");
+    write(&root.path().join("keyboard.rs"), "fn key() {}\n");
+
+    for path in [
+        "lca.toml",
+        "LCA.TOML",
+        "./lca.toml",
+        "nested/lca.toml",
+        "nested\\lca.toml",
+        "opencode.json",
+        ".env",
+        ".env.local",
+        "id_rsa",
+        "certs/server.pem",
+        "credentials.json",
+        "secrets.toml",
+    ] {
+        let error = execute_validated(
+            &action("read_file", json!({"path": path})),
+            &sandbox,
+            &wide_limits(),
+        )
+        .expect_err(path);
+        assert_eq!(error.kind(), "privacy_denied", "{path} -> {error}");
+        assert!(!error.to_string().contains("SENTINEL"), "{path}");
+    }
+
+    let template = run(
+        &sandbox,
+        &wide_limits(),
+        "read_file",
+        json!({"path": ".env.example"}),
+    );
+    let FsOutcome::Read(template) = template else {
+        panic!("template");
+    };
+    assert_eq!(template.content, "TEMPLATE\n");
+
+    let source = run(
+        &sandbox,
+        &wide_limits(),
+        "read_file",
+        json!({"path": "nested/src/main.rs"}),
+    );
+    let FsOutcome::Read(source) = source else {
+        panic!("source");
+    };
+    assert!(source.content.contains("fn main"));
+    let keyboard = run(
+        &sandbox,
+        &wide_limits(),
+        "read_file",
+        json!({"path": "keyboard.rs"}),
+    );
+    assert!(matches!(keyboard, FsOutcome::Read(_)));
+
+    let traversal = execute_validated(
+        &action("read_file", json!({"path": "nested/../lca.toml"})),
+        &sandbox,
+        &wide_limits(),
+    )
+    .expect_err("traversal");
+    assert_eq!(traversal.kind(), "invalid_path");
+    assert!(!traversal.to_string().contains("SENTINEL"));
+
+    let listed = run(
+        &sandbox,
+        &wide_limits(),
+        "list_directory",
+        json!({"path": "."}),
+    );
+    let FsOutcome::Listed(listed) = listed else {
+        panic!("list");
+    };
+    let names: Vec<&str> = listed
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    for hidden in [
+        "lca.toml",
+        "opencode.json",
+        ".env",
+        ".env.local",
+        "id_rsa",
+        "credentials.json",
+        "secrets.toml",
+    ] {
+        assert!(!names.contains(&hidden), "{names:?}");
+    }
+    assert!(names.contains(&"Cargo.toml"));
+    assert!(names.contains(&".env.example"));
+    assert!(names.contains(&"keyboard.rs"));
+    let rendered = format!("{listed:?}");
+    assert!(!rendered.contains("suppressed"), "{rendered}");
+    assert!(!rendered.contains("SENTINEL"), "{rendered}");
+
+    let searched = run(
+        &sandbox,
+        &wide_limits(),
+        "search_files",
+        json!({"query": "SENTINEL", "path": "."}),
+    );
+    let FsOutcome::Searched(searched) = searched else {
+        panic!("search");
+    };
+    assert!(
+        searched.matches.is_empty(),
+        "protected hits leaked: {searched:?}"
+    );
+
+    let patch = patch_text("lca.toml", "SENTINEL_LCA", "nope");
+    let denied = execute_validated(
+        &action("apply_patch", json!({"path": "lca.toml", "patch": patch})),
+        &sandbox,
+        &wide_limits(),
+    )
+    .expect_err("patch");
+    assert_eq!(denied.kind(), "privacy_denied");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("lca.toml")).expect("unchanged"),
+        "SENTINEL_LCA\n"
+    );
+
+    let custom = PrivacyPolicy::try_from_patterns(&["notes/*.secret".to_owned()]).expect("custom");
+    let custom_root = TempDir::new("privacy-custom");
+    std::fs::create_dir(custom_root.path().join("notes")).expect("notes");
+    write(
+        &custom_root.path().join("notes").join("local.secret"),
+        "SENTINEL_CUSTOM\n",
+    );
+    write(
+        &custom_root.path().join("notes").join("lib.rs"),
+        "fn kept() {}\n",
+    );
+    let custom_sandbox =
+        WorkspaceSandbox::with_privacy(custom_root.path(), custom).expect("custom sandbox");
+    let blocked = execute_validated(
+        &action("read_file", json!({"path": "notes/local.secret"})),
+        &custom_sandbox,
+        &wide_limits(),
+    )
+    .expect_err("custom");
+    assert_eq!(blocked.kind(), "privacy_denied");
+    let kept = run(
+        &custom_sandbox,
+        &wide_limits(),
+        "read_file",
+        json!({"path": "notes/lib.rs"}),
+    );
+    let FsOutcome::Read(kept) = kept else {
+        panic!("kept");
+    };
+    assert!(kept.content.contains("fn kept"));
+    assert!(
+        PrivacyPolicy::try_from_patterns(&["../secrets".to_owned()]).is_err(),
+        "invalid patterns must not be ignored"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_cannot_expose_a_protected_file_or_escape() {
+    let workspace = TempDir::new("privacy-junction");
+    let outside = TempDir::new("privacy-outside");
+    write(&outside.path().join("secret.txt"), "SENTINEL_OUTSIDE\n");
+    let link = workspace.path().join("alias");
+    let (guard, created) = make_junction(&link, outside.path());
+    created.expect("mklink /J");
+    let sandbox = WorkspaceSandbox::new(workspace.path()).expect("sandbox");
+    let error = execute_validated(
+        &action("read_file", json!({"path": "alias/secret.txt"})),
+        &sandbox,
+        &wide_limits(),
+    )
+    .expect_err("junction");
+    assert_eq!(error.kind(), "reparse_denied", "{error}");
+    assert!(!error.to_string().contains("SENTINEL_OUTSIDE"));
+    drop(guard);
+}
+
+#[test]
+fn a_hardlink_alias_of_a_protected_file_is_not_detected() {
+    let root = TempDir::new("privacy-hardlink");
+    let secret = root.path().join(".env");
+    let alias = root.path().join("notes.txt");
+    write(&secret, "alias-visible\n");
+    std::fs::hard_link(&secret, &alias).expect("hard link");
+    let sandbox = WorkspaceSandbox::new(root.path()).expect("sandbox");
+    let denied = execute_validated(
+        &action("read_file", json!({"path": ".env"})),
+        &sandbox,
+        &wide_limits(),
+    )
+    .expect_err("name");
+    assert_eq!(denied.kind(), "privacy_denied");
+    assert!(!denied.to_string().contains("alias-visible"));
+    let read = run(
+        &sandbox,
+        &wide_limits(),
+        "read_file",
+        json!({"path": "notes.txt"}),
+    );
+    let FsOutcome::Read(read) = read else {
+        panic!("alias");
+    };
+    assert_eq!(read.content, "alias-visible\n");
 }
 
 #[test]

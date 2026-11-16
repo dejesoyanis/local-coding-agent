@@ -12,13 +12,20 @@
 
 mod dispatch;
 mod error;
+mod eval;
 mod lifecycle;
 mod task;
 mod turn;
 
 pub use dispatch::{WriteConfirmation, commit_prepared, dispatch_validated};
 pub use error::{AgentError, AgentResult};
+pub use eval::{
+    EvalError, EvalExecution, EvalIdentity, EvalPlan, EvalReport, evaluate_tool_selection,
+};
 pub use lifecycle::{AgentLifecycle, AgentStatus};
 pub use task::AgentTask;
-pub use turn::{ExecutedAction, SingleTurnAgentController, TurnError, TurnReport, TurnSettings};
+pub use turn::{
+    ExecutedAction, PROMPT_VERSION, ResponseClass, SingleTurnAgentController, TurnError,
+    TurnReport, TurnSettings, classify_response,
+};
 pub use uuid::Uuid;

@@ -18,6 +18,7 @@ mod executor;
 mod fs_error;
 mod model;
 mod pathutil;
+mod privacy;
 
 pub use action::{
     ActionId, ActionIdFactory, ActionSource, ActionStatus, ActionValidationError, AgentAction,
@@ -36,4 +37,5 @@ pub use fs::{
 };
 pub use fs_error::FsError;
 pub use model::{ToolArguments, ToolName, ToolRequest, ToolResult};
+pub use privacy::{PrivacyPatternError, PrivacyPolicy, deny_overrides};
 pub use sandbox::{ResolvedKind, ResolvedPath, WorkspaceSandbox};

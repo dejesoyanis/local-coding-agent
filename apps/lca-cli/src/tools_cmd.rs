@@ -10,7 +10,7 @@ use lca_config::{AgentConfig, load_from_path};
 use lca_core::{WriteConfirmation, commit_prepared, dispatch_validated};
 use lca_tools::{
     ActionIdFactory, ActionSource, ApprovalLedger, FsError, FsLimitValues, FsLimits, FsOutcome,
-    ToolRegistry, WorkspaceSandbox, propose_actions, validate_batch,
+    PrivacyPolicy, ToolRegistry, WorkspaceSandbox, propose_actions, validate_batch,
 };
 use serde_json::{Value, json};
 
@@ -184,10 +184,16 @@ fn dispatch_named(
 
 fn open_workspace(config: &Path) -> Result<(WorkspaceSandbox, FsLimits), String> {
     let loaded = load_from_path(config).map_err(|error| error.to_string())?;
-    let sandbox =
-        WorkspaceSandbox::new(loaded.workspace_root()).map_err(|error| error.to_string())?;
+    let sandbox = sandbox_from(&loaded)?;
     let limits = limits_from(&loaded)?;
     Ok((sandbox, limits))
+}
+
+pub(crate) fn sandbox_from(config: &AgentConfig) -> Result<WorkspaceSandbox, String> {
+    let privacy = PrivacyPolicy::try_from_patterns(config.privacy_excludes())
+        .map_err(|error| error.to_string())?;
+    WorkspaceSandbox::with_privacy(config.workspace_root(), privacy)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn limits_from(config: &AgentConfig) -> Result<FsLimits, String> {

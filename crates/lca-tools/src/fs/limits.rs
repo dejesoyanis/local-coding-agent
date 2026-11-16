@@ -117,6 +117,16 @@ impl FsLimits {
         })
     }
 
+    /// Copy of these limits with patch preparation turned off.
+    ///
+    /// Read limits are unchanged. This does not grant a write and does not disable approval.
+    #[must_use]
+    pub fn read_only(&self) -> Self {
+        let mut limits = self.clone();
+        limits.write_enabled = false;
+        limits
+    }
+
     #[must_use]
     pub const fn read_enabled(&self) -> bool {
         self.read_enabled

@@ -98,6 +98,7 @@ pub struct AgentConfig {
     tool_max_search_matches: usize,
     tool_max_search_files: usize,
     tool_max_search_total_bytes: u64,
+    privacy_excludes: Vec<String>,
 }
 
 /// Values that are safe to print and to record in diagnostics.
@@ -141,6 +142,8 @@ pub struct ConfigSummary {
     pub tool_max_search_files: usize,
     /// Maximum bytes a search may read.
     pub tool_max_search_total_bytes: u64,
+    /// Number of extra privacy exclusions. The mandatory baseline is not included.
+    pub privacy_exclude_count: usize,
 }
 
 impl AgentConfig {
@@ -170,6 +173,7 @@ impl AgentConfig {
             tool_max_search_matches: tools.max_search_matches,
             tool_max_search_files: tools.max_search_files,
             tool_max_search_total_bytes: tools.max_search_total_bytes,
+            privacy_excludes: tools.privacy_excludes,
         }
     }
 
@@ -287,6 +291,12 @@ impl AgentConfig {
         self.tool_max_search_total_bytes
     }
 
+    /// Extra privacy exclusions. These do not replace the mandatory baseline.
+    #[must_use]
+    pub fn privacy_excludes(&self) -> &[String] {
+        &self.privacy_excludes
+    }
+
     /// Copy of the fields that diagnostics are allowed to show.
     #[must_use]
     pub fn summary(&self) -> ConfigSummary {
@@ -310,6 +320,7 @@ impl AgentConfig {
             tool_max_search_matches: self.tool_max_search_matches,
             tool_max_search_files: self.tool_max_search_files,
             tool_max_search_total_bytes: self.tool_max_search_total_bytes,
+            privacy_exclude_count: self.privacy_excludes.len(),
         }
     }
 }
@@ -356,6 +367,8 @@ pub(crate) struct RawTools {
     pub(crate) max_search_matches: Option<u64>,
     pub(crate) max_search_files: Option<u64>,
     pub(crate) max_search_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub(crate) privacy_excludes: Vec<String>,
 }
 
 pub(crate) struct ResolvedTools {
@@ -367,6 +380,7 @@ pub(crate) struct ResolvedTools {
     pub(crate) max_search_matches: usize,
     pub(crate) max_search_files: usize,
     pub(crate) max_search_total_bytes: u64,
+    pub(crate) privacy_excludes: Vec<String>,
 }
 
 pub(crate) struct CheckedEndpoint {
@@ -569,7 +583,17 @@ pub(crate) fn resolve_tools(raw: &RawTools) -> Result<ResolvedTools, ConfigError
             MAX_TOOL_SEARCH_TOTAL_BYTES,
             "tools.max_search_total_bytes",
         )?,
+        privacy_excludes: checked_privacy_excludes(&raw.privacy_excludes)?,
     })
+}
+
+fn checked_privacy_excludes(patterns: &[String]) -> Result<Vec<String>, ConfigError> {
+    lca_tools::PrivacyPolicy::try_from_patterns(patterns)
+        .map(|policy| policy.extra_patterns().to_vec())
+        .map_err(|error| ConfigError::InvalidValue {
+            field: "tools.privacy_excludes",
+            message: error.to_string(),
+        })
 }
 
 fn bounded_u64(value: u64, max: u64, field: &'static str) -> Result<u64, ConfigError> {

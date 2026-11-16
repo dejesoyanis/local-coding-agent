@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use url::Url;
 
-use crate::dto::{TagsResponse, VersionResponse, model_is_present};
+use crate::dto::{ModelIdentity, TagsResponse, VersionResponse, model_is_present, names_match};
 use crate::error::{OllamaAvailability, OllamaError};
 
 const MAX_ENDPOINT_LEN: usize = 2048;
@@ -64,6 +64,26 @@ impl HttpOllamaClient {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Reads the server version and, when present, the requested model's digest.
+    ///
+    /// A missing digest is `None`. This does not download the model and does not generate text.
+    pub fn describe_model(&self, model: &str) -> Result<ModelIdentity, String> {
+        if !valid_model_name(model) {
+            return Err("model name is invalid".to_owned());
+        }
+        let version = self.get_json::<VersionResponse>("/api/version")?;
+        let tags = self.get_json::<TagsResponse>("/api/tags")?;
+        let digest = tags
+            .models
+            .iter()
+            .find(|candidate| names_match(model, &candidate.name))
+            .and_then(|candidate| candidate.digest.clone());
+        Ok(ModelIdentity {
+            version: version.version,
+            digest,
+        })
     }
 
     fn check_model_inner(&self, model: &str) -> OllamaAvailability {

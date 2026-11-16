@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::fs_error::{FsError, display_path};
 use crate::pathutil::{is_within, paths_equivalent, simplify_verbatim};
+use crate::privacy::{PrivacyPolicy, lexical_relative};
 
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -104,16 +105,28 @@ impl ResolvedPath {
 }
 
 /// Immutable workspace root for one process.
+///
+/// [`Self::privacy`] is a separate denial layer. A path the sandbox would otherwise
+/// open can still be rejected before its bytes are read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSandbox {
     root: PathBuf,
+    privacy: PrivacyPolicy,
 }
 
 impl WorkspaceSandbox {
     /// Accepts an existing directory and stores its canonical path.
     ///
-    /// The stored root does not change for the life of this value.
+    /// The stored root does not change for the life of this value. Privacy is the
+    /// mandatory baseline.
     pub fn new(root: &Path) -> Result<Self, FsError> {
+        Self::with_privacy(root, PrivacyPolicy::baseline())
+    }
+
+    /// Same root capture as [`Self::new`], with extra privacy exclusions.
+    ///
+    /// The baseline names stay in `privacy`. This constructor does not replace them.
+    pub fn with_privacy(root: &Path, privacy: PrivacyPolicy) -> Result<Self, FsError> {
         let metadata = match std::fs::metadata(root) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -150,7 +163,7 @@ impl WorkspaceSandbox {
                 path: root.display().to_string(),
             });
         }
-        Ok(Self { root })
+        Ok(Self { root, privacy })
     }
 
     /// Canonical workspace root.
@@ -159,11 +172,36 @@ impl WorkspaceSandbox {
         &self.root
     }
 
+    /// Privacy rules bound to this root. The baseline cannot be removed.
+    #[must_use]
+    pub fn privacy(&self) -> &PrivacyPolicy {
+        &self.privacy
+    }
+
+    /// Resolves `raw` after rejecting a protected name.
+    ///
+    /// A lexically protected path is rejected before [`Self::resolve`], so the file
+    /// is not opened. A path that resolves and is still protected is rejected before
+    /// the caller reads bytes.
+    pub(crate) fn resolve_visible(&self, raw: &str) -> Result<ResolvedPath, FsError> {
+        if let Some(relative) = lexical_relative(raw)
+            && self.privacy.blocks(&relative)
+        {
+            return Err(FsError::PrivacyDenied);
+        }
+        let resolved = self.resolve(raw)?;
+        if self.privacy.blocks(resolved.relative()) {
+            return Err(FsError::PrivacyDenied);
+        }
+        Ok(resolved)
+    }
+
     /// Reads one resolved file without following a final reparse point.
     ///
     /// The read fails when the file is larger than `max_bytes`. It does not return a prefix.
+    /// A protected path is rejected before the file is opened.
     pub fn read_bytes(&self, relative: &str, max_bytes: u64) -> Result<Vec<u8>, FsError> {
-        let resolved = self.resolve(relative)?;
+        let resolved = self.resolve_visible(relative)?;
         read_resolved_file(&resolved, max_bytes)
     }
 

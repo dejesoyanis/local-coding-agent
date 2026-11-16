@@ -19,6 +19,18 @@ pub struct TagsResponse {
 pub struct RemoteModel {
     /// Name advertised by Ollama, often `name:tag`.
     pub name: String,
+    /// Content digest, when the server sent one.
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
+/// Version and digest recorded for a reliability report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// Value of `/api/version`.
+    pub version: String,
+    /// Digest of the requested model, when `/api/tags` included one.
+    pub digest: Option<String>,
 }
 
 /// Returns whether `requested` matches an advertised model name or its untagged base.

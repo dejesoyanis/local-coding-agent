@@ -6,6 +6,7 @@ publish = false
 description = "Typed configuration loading and validation for the local coding agent."
 
 [dependencies]
+lca-tools = { path = "../lca-tools" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.8"
