@@ -491,3 +491,88 @@ fn serve_routes(routes: &[(&str, u16, &str)]) -> (String, Arc<Mutex<Vec<String>>
     });
     (format!("http://{address}"), captured)
 }
+
+#[test]
+fn filesystem_commands_stay_inside_the_workspace() {
+    let workspace = TempDir::new("fs-cli");
+    fs::create_dir(workspace.path().join("src")).expect("src");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    fs::write(
+        workspace.path().join("src").join("lib.rs"),
+        "pub trait ModelRuntime {}\n",
+    )
+    .expect("lib");
+    let (config, _) = write_valid_config(workspace.path());
+    let config = config.to_str().expect("utf-8 config path");
+
+    let list = run(&["tools", "list", "--config", config]);
+    let stdout = text(&list.stdout);
+    let stderr = text(&list.stderr);
+    assert_eq!(list.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("file: notes.txt"), "{stdout}");
+    assert!(stdout.contains("directory: src"), "{stdout}");
+
+    let read = run(&["tools", "read", "notes.txt", "--config", config]);
+    let stdout = text(&read.stdout);
+    let stderr = text(&read.stderr);
+    assert_eq!(read.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("alpha"), "{stdout}");
+    assert!(stdout.contains("truncated: false"), "{stdout}");
+
+    let search = run(&[
+        "tools",
+        "search",
+        "ModelRuntime",
+        "--path",
+        "src",
+        "--config",
+        config,
+    ]);
+    let stdout = text(&search.stdout);
+    let stderr = text(&search.stderr);
+    assert_eq!(search.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("match: src/lib.rs:1:"), "{stdout}");
+
+    let outside = run(&["tools", "read", "../notes.txt", "--config", config]);
+    assert_ne!(outside.status.code(), Some(0));
+    let combined = format!("{}{}", text(&outside.stdout), text(&outside.stderr));
+    assert!(!combined.contains("alpha"), "{combined}");
+
+    let flagged = run(&[
+        "tools",
+        "patch",
+        "prepare",
+        "--yes",
+        "edit.diff",
+        "--config",
+        config,
+    ]);
+    assert_ne!(flagged.status.code(), Some(0));
+
+    fs::write(
+        workspace.path().join("edit.diff"),
+        "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,1 +1,1 @@\n-alpha\n+beta\n",
+    )
+    .expect("diff");
+    let mut rejected = Command::new(env!("CARGO_BIN_EXE_lca"))
+        .args(["tools", "patch", "prepare", "edit.diff", "--config", config])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    {
+        let mut stdin = rejected.stdin.take().expect("stdin");
+        stdin.write_all(b"no\n").expect("write stdin");
+    }
+    let output = rejected.wait_with_output().expect("wait");
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_ne!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("approval: required"), "{stdout}");
+    assert!(stdout.contains("applied: false"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("notes.txt")).expect("unchanged"),
+        "alpha\n"
+    );
+}

@@ -11,24 +11,29 @@ const MAX_ARGUMENT_LIMIT: usize = 64 * 1024;
 
 /// Coarse permission recorded on a registry entry.
 ///
-/// Only [`Self::Diagnostic`] is granted. The other categories exist so a registered tool
-/// is not authorized merely because it was inserted.
+/// Registration is not execution. [`Self::WorkspaceMutation`] is granted only together
+/// with [`ToolEffect::ApprovalRequired`]. A [`ToolEffect::Mutating`] tool stays denied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PermissionCategory {
-    /// Harmless diagnostic proposal.
+    /// Harmless diagnostic proposal. The probe validates it and does not run it.
     Diagnostic,
-    /// Workspace inspection. Not granted in this milestone.
+    /// Workspace inspection inside the sandbox.
     WorkspaceRead,
-    /// Workspace or process mutation. Not granted in this milestone.
+    /// A workspace write that still requires a user approval before any bytes change.
     WorkspaceMutation,
 }
 
-/// Whether a tool would change the machine if a later milestone executed it.
+/// Whether a tool would change the machine if a caller dispatched it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolEffect {
-    /// The tool would not modify files or start a process.
+    /// The tool does not modify files or start a process.
     ReadOnly,
-    /// The tool would modify files or start a process.
+    /// The tool may write one file after a separate, action-bound approval.
+    ///
+    /// Validation of this effect does not write. Dispatch prepares the change.
+    /// Applying it requires an approval grant.
+    ApprovalRequired,
+    /// The tool would modify files or start a process without that approval boundary.
     Mutating,
 }
 
@@ -160,10 +165,26 @@ impl ToolRegistry {
         Self { tools: Vec::new() }
     }
 
-    /// The milestone registry. It contains only `diagnostic_echo`.
+    /// The probe registry. It contains only `diagnostic_echo`.
+    ///
+    /// `lca tools probe` uses this registry so the model is offered the diagnostic tool
+    /// and not the filesystem tools.
     pub fn diagnostic() -> Result<Self, RegistryError> {
         let mut registry = Self { tools: Vec::new() };
         registry.insert(diagnostic_echo()?)?;
+        Ok(registry)
+    }
+
+    /// Diagnostic tool plus the filesystem tools.
+    ///
+    /// The filesystem tools are validated here and executed only by the sandbox dispatcher.
+    pub fn workspace() -> Result<Self, RegistryError> {
+        let mut registry = Self { tools: Vec::new() };
+        registry.insert(diagnostic_echo()?)?;
+        registry.insert(list_directory_tool()?)?;
+        registry.insert(read_file_tool()?)?;
+        registry.insert(search_files_tool()?)?;
+        registry.insert(apply_patch_tool()?)?;
         Ok(registry)
     }
 
@@ -211,6 +232,94 @@ fn diagnostic_echo() -> Result<RegisteredTool, RegistryError> {
     )
 }
 
+fn path_property() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "Workspace-relative path. Absolute paths and parent segments are rejected."
+    })
+}
+
+fn list_directory_tool() -> Result<RegisteredTool, RegistryError> {
+    RegisteredTool::try_new(
+        "list_directory",
+        "List the names in one workspace directory. The listing is not recursive and does not follow symlinks or junctions.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": { "path": path_property() }
+        }),
+        PermissionCategory::WorkspaceRead,
+        ToolEffect::ReadOnly,
+        MAX_ARGUMENT_BYTES,
+    )
+}
+
+fn read_file_tool() -> Result<RegisteredTool, RegistryError> {
+    RegisteredTool::try_new(
+        "read_file",
+        "Read one UTF-8 text file inside the workspace. Binary files, directories, and files above the size limit are rejected.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": { "path": path_property() }
+        }),
+        PermissionCategory::WorkspaceRead,
+        ToolEffect::ReadOnly,
+        MAX_ARGUMENT_BYTES,
+    )
+}
+
+fn search_files_tool() -> Result<RegisteredTool, RegistryError> {
+    RegisteredTool::try_new(
+        "search_files",
+        "Find a literal text query in workspace files. The search does not evaluate regular expressions and does not follow symlinks or junctions.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                },
+                "path": path_property()
+            }
+        }),
+        PermissionCategory::WorkspaceRead,
+        ToolEffect::ReadOnly,
+        MAX_ARGUMENT_BYTES,
+    )
+}
+
+fn apply_patch_tool() -> Result<RegisteredTool, RegistryError> {
+    RegisteredTool::try_new(
+        "apply_patch",
+        "Prepare a unified diff for one existing text file. Validation does not write. Applying the prepared bytes requires a separate user approval for that action.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "patch"],
+            "properties": {
+                "path": path_property(),
+                "patch": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 20000,
+                    "description": "Unified diff for the single path. File creation and deletion are rejected."
+                }
+            }
+        }),
+        PermissionCategory::WorkspaceMutation,
+        ToolEffect::ApprovalRequired,
+        64 * 1024,
+    )
+}
+
 fn invalid(message: impl Into<String>) -> RegistryError {
     RegistryError::Invalid {
         message: message.into(),
@@ -242,6 +351,34 @@ mod tests {
         assert!(registry.get("Diagnostic_Echo").is_none());
         assert!(registry.get("diagnostic_echo ").is_none());
         assert!(registry.get("execute_command").is_none());
+    }
+
+    #[test]
+    fn workspace_registry_adds_the_filesystem_tools() {
+        let registry = ToolRegistry::workspace().expect("registry");
+        let names: Vec<&str> = registry.iter().map(RegisteredTool::name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "diagnostic_echo",
+                "list_directory",
+                "read_file",
+                "search_files",
+                "apply_patch"
+            ]
+        );
+        assert_eq!(
+            registry.get("read_file").expect("read").effect(),
+            ToolEffect::ReadOnly
+        );
+        assert_eq!(
+            registry.get("apply_patch").expect("patch").effect(),
+            ToolEffect::ApprovalRequired
+        );
+        assert_eq!(
+            registry.get("apply_patch").expect("patch").permission(),
+            PermissionCategory::WorkspaceMutation
+        );
     }
 
     #[test]

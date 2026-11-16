@@ -7,8 +7,12 @@ description = "Workspace-scoped tool requests and authorization. Execution is di
 
 [dependencies]
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
 
 [lints]
 workspace = true

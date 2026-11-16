@@ -48,6 +48,30 @@ pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Largest accepted model name, in bytes.
 pub const MAX_MODEL_NAME_LEN: usize = 256;
 
+/// Default maximum size of one text file, in bytes (1 MiB).
+pub const DEFAULT_TOOL_MAX_FILE_SIZE_BYTES: u64 = 1_048_576;
+
+/// Default maximum read response, in bytes (256 KiB).
+pub const DEFAULT_TOOL_MAX_RESPONSE_BYTES: u64 = 262_144;
+
+/// Default maximum directory entries returned.
+pub const DEFAULT_TOOL_MAX_DIRECTORY_ENTRIES: usize = 1_000;
+
+/// Default maximum search hits.
+pub const DEFAULT_TOOL_MAX_SEARCH_MATCHES: usize = 100;
+
+/// Default maximum files a search may read.
+pub const DEFAULT_TOOL_MAX_SEARCH_FILES: usize = 1_000;
+
+/// Default maximum bytes a search may read (32 MiB).
+pub const DEFAULT_TOOL_MAX_SEARCH_TOTAL_BYTES: u64 = 33_554_432;
+
+const MAX_TOOL_FILE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TOOL_DIRECTORY_ENTRIES: usize = 10_000;
+const MAX_TOOL_SEARCH_MATCHES: usize = 10_000;
+const MAX_TOOL_SEARCH_FILES: usize = 100_000;
+const MAX_TOOL_SEARCH_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
 const MAX_ENDPOINT_LEN: usize = 2048;
 
 /// Validated agent configuration.
@@ -66,6 +90,14 @@ pub struct AgentConfig {
     timeout: Duration,
     request_timeout: Duration,
     connect_timeout: Duration,
+    tool_read_enabled: bool,
+    tool_write_enabled: bool,
+    tool_max_file_size_bytes: u64,
+    tool_max_response_bytes: u64,
+    tool_max_directory_entries: usize,
+    tool_max_search_matches: usize,
+    tool_max_search_files: usize,
+    tool_max_search_total_bytes: u64,
 }
 
 /// Values that are safe to print and to record in diagnostics.
@@ -91,6 +123,24 @@ pub struct ConfigSummary {
     pub request_timeout_secs: u64,
     /// TCP connect timeout in seconds.
     pub connect_timeout_secs: u64,
+    /// Whether read tools are enabled.
+    pub tool_read_enabled: bool,
+    /// Whether patch preparation is enabled. Application still requires approval.
+    pub tool_write_enabled: bool,
+    /// Write approval cannot be turned off.
+    pub require_write_approval: bool,
+    /// Maximum file size in bytes.
+    pub tool_max_file_size_bytes: u64,
+    /// Maximum read response in bytes.
+    pub tool_max_response_bytes: u64,
+    /// Maximum directory entries.
+    pub tool_max_directory_entries: usize,
+    /// Maximum search hits.
+    pub tool_max_search_matches: usize,
+    /// Maximum files a search may read.
+    pub tool_max_search_files: usize,
+    /// Maximum bytes a search may read.
+    pub tool_max_search_total_bytes: u64,
 }
 
 impl AgentConfig {
@@ -99,6 +149,7 @@ impl AgentConfig {
         endpoint: CheckedEndpoint,
         model: String,
         limits: ResolvedLimits,
+        tools: ResolvedTools,
     ) -> Self {
         Self {
             workspace_root,
@@ -111,6 +162,14 @@ impl AgentConfig {
             timeout: limits.timeout,
             request_timeout: limits.request_timeout,
             connect_timeout: limits.connect_timeout,
+            tool_read_enabled: tools.read_enabled,
+            tool_write_enabled: tools.write_enabled,
+            tool_max_file_size_bytes: tools.max_file_size_bytes,
+            tool_max_response_bytes: tools.max_response_bytes,
+            tool_max_directory_entries: tools.max_directory_entries,
+            tool_max_search_matches: tools.max_search_matches,
+            tool_max_search_files: tools.max_search_files,
+            tool_max_search_total_bytes: tools.max_search_total_bytes,
         }
     }
 
@@ -174,6 +233,60 @@ impl AgentConfig {
         self.connect_timeout
     }
 
+    /// Whether read tools may run. This does not approve writes.
+    #[must_use]
+    pub const fn tool_read_enabled(&self) -> bool {
+        self.tool_read_enabled
+    }
+
+    /// Whether a patch may be prepared. Applying it still requires approval.
+    #[must_use]
+    pub const fn tool_write_enabled(&self) -> bool {
+        self.tool_write_enabled
+    }
+
+    /// Always true. Configuration cannot disable write approval.
+    #[must_use]
+    pub const fn require_write_approval(&self) -> bool {
+        true
+    }
+
+    /// Maximum file size in bytes.
+    #[must_use]
+    pub const fn tool_max_file_size_bytes(&self) -> u64 {
+        self.tool_max_file_size_bytes
+    }
+
+    /// Maximum bytes returned by one read.
+    #[must_use]
+    pub const fn tool_max_response_bytes(&self) -> u64 {
+        self.tool_max_response_bytes
+    }
+
+    /// Maximum directory entries returned.
+    #[must_use]
+    pub const fn tool_max_directory_entries(&self) -> usize {
+        self.tool_max_directory_entries
+    }
+
+    /// Maximum search hits.
+    #[must_use]
+    pub const fn tool_max_search_matches(&self) -> usize {
+        self.tool_max_search_matches
+    }
+
+    /// Maximum files a search may read.
+    #[must_use]
+    pub const fn tool_max_search_files(&self) -> usize {
+        self.tool_max_search_files
+    }
+
+    /// Maximum bytes a search may read.
+    #[must_use]
+    pub const fn tool_max_search_total_bytes(&self) -> u64 {
+        self.tool_max_search_total_bytes
+    }
+
     /// Copy of the fields that diagnostics are allowed to show.
     #[must_use]
     pub fn summary(&self) -> ConfigSummary {
@@ -188,6 +301,15 @@ impl AgentConfig {
             timeout_secs: self.timeout.as_secs(),
             request_timeout_secs: self.request_timeout.as_secs(),
             connect_timeout_secs: self.connect_timeout.as_secs(),
+            tool_read_enabled: self.tool_read_enabled,
+            tool_write_enabled: self.tool_write_enabled,
+            require_write_approval: true,
+            tool_max_file_size_bytes: self.tool_max_file_size_bytes,
+            tool_max_response_bytes: self.tool_max_response_bytes,
+            tool_max_directory_entries: self.tool_max_directory_entries,
+            tool_max_search_matches: self.tool_max_search_matches,
+            tool_max_search_files: self.tool_max_search_files,
+            tool_max_search_total_bytes: self.tool_max_search_total_bytes,
         }
     }
 }
@@ -200,6 +322,8 @@ pub(crate) struct RawConfig {
     pub(crate) ollama: RawOllama,
     #[serde(default)]
     pub(crate) limits: RawLimits,
+    #[serde(default)]
+    pub(crate) tools: RawTools,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -218,6 +342,31 @@ pub(crate) struct RawOllama {
 pub(crate) struct RawLimits {
     pub(crate) max_steps: Option<u32>,
     pub(crate) timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawTools {
+    pub(crate) read_enabled: Option<bool>,
+    pub(crate) write_enabled: Option<bool>,
+    pub(crate) require_write_approval: Option<bool>,
+    pub(crate) max_file_size_bytes: Option<u64>,
+    pub(crate) max_response_bytes: Option<u64>,
+    pub(crate) max_directory_entries: Option<u64>,
+    pub(crate) max_search_matches: Option<u64>,
+    pub(crate) max_search_files: Option<u64>,
+    pub(crate) max_search_total_bytes: Option<u64>,
+}
+
+pub(crate) struct ResolvedTools {
+    pub(crate) read_enabled: bool,
+    pub(crate) write_enabled: bool,
+    pub(crate) max_file_size_bytes: u64,
+    pub(crate) max_response_bytes: u64,
+    pub(crate) max_directory_entries: usize,
+    pub(crate) max_search_matches: usize,
+    pub(crate) max_search_files: usize,
+    pub(crate) max_search_total_bytes: u64,
 }
 
 pub(crate) struct CheckedEndpoint {
@@ -370,6 +519,89 @@ pub(crate) fn check_request_timeout_secs(value: u64) -> Result<Duration, ConfigE
 
 pub(crate) fn check_connect_timeout_secs(value: u64) -> Result<Duration, ConfigError> {
     check_bounded_secs(value, "ollama.connect_timeout_secs")
+}
+
+pub(crate) fn resolve_tools(raw: &RawTools) -> Result<ResolvedTools, ConfigError> {
+    if raw.require_write_approval == Some(false) {
+        return Err(ConfigError::InvalidValue {
+            field: "tools.require_write_approval",
+            message: "write approval cannot be disabled".to_owned(),
+        });
+    }
+    let max_file_size_bytes = bounded_u64(
+        raw.max_file_size_bytes
+            .unwrap_or(DEFAULT_TOOL_MAX_FILE_SIZE_BYTES),
+        MAX_TOOL_FILE_SIZE_BYTES,
+        "tools.max_file_size_bytes",
+    )?;
+    let max_response_bytes = bounded_u64(
+        raw.max_response_bytes
+            .unwrap_or(DEFAULT_TOOL_MAX_RESPONSE_BYTES),
+        max_file_size_bytes,
+        "tools.max_response_bytes",
+    )?;
+    Ok(ResolvedTools {
+        read_enabled: raw.read_enabled.unwrap_or(true),
+        write_enabled: raw.write_enabled.unwrap_or(true),
+        max_file_size_bytes,
+        max_response_bytes,
+        max_directory_entries: bounded_count(
+            raw.max_directory_entries,
+            DEFAULT_TOOL_MAX_DIRECTORY_ENTRIES,
+            MAX_TOOL_DIRECTORY_ENTRIES,
+            "tools.max_directory_entries",
+        )?,
+        max_search_matches: bounded_count(
+            raw.max_search_matches,
+            DEFAULT_TOOL_MAX_SEARCH_MATCHES,
+            MAX_TOOL_SEARCH_MATCHES,
+            "tools.max_search_matches",
+        )?,
+        max_search_files: bounded_count(
+            raw.max_search_files,
+            DEFAULT_TOOL_MAX_SEARCH_FILES,
+            MAX_TOOL_SEARCH_FILES,
+            "tools.max_search_files",
+        )?,
+        max_search_total_bytes: bounded_u64(
+            raw.max_search_total_bytes
+                .unwrap_or(DEFAULT_TOOL_MAX_SEARCH_TOTAL_BYTES),
+            MAX_TOOL_SEARCH_TOTAL_BYTES,
+            "tools.max_search_total_bytes",
+        )?,
+    })
+}
+
+fn bounded_u64(value: u64, max: u64, field: &'static str) -> Result<u64, ConfigError> {
+    if value == 0 || value > max {
+        return Err(ConfigError::InvalidValue {
+            field,
+            message: format!("must be from 1 through {max}"),
+        });
+    }
+    Ok(value)
+}
+
+fn bounded_count(
+    value: Option<u64>,
+    default: usize,
+    max: usize,
+    field: &'static str,
+) -> Result<usize, ConfigError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let count = usize::try_from(value).map_err(|_| ConfigError::InvalidValue {
+        field,
+        message: format!("must be from 1 through {max}"),
+    })?;
+    if count == 0 || count > max {
+        return Err(ConfigError::InvalidValue {
+            field,
+            message: format!("must be from 1 through {max}"),
+        });
+    }
+    Ok(count)
 }
 
 fn check_bounded_secs(value: u64, field: &'static str) -> Result<Duration, ConfigError> {

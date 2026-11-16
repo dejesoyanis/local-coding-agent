@@ -55,6 +55,16 @@ fn append_component(path: &mut PathBuf, component: Component<'_>) {
     }
 }
 
+pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left: Vec<_> = left.components().collect();
+    let right: Vec<_> = right.components().collect();
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| component_eq(a, b))
+}
+
 pub(crate) fn is_within(root: &Path, candidate: &Path) -> bool {
     let root_parts: Vec<_> = root.components().collect();
     let candidate_parts: Vec<_> = candidate.components().collect();

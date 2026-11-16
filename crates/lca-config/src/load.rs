@@ -8,7 +8,7 @@ use crate::model::{
     DEFAULT_MAX_STEPS, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL, DEFAULT_REQUEST_TIMEOUT_SECS,
     DEFAULT_TIMEOUT_SECS, MAX_CONFIG_BYTES, RawConfig, ResolvedLimits, check_connect_timeout_secs,
     check_context_window, check_endpoint, check_generation_limit, check_max_steps, check_model,
-    check_request_timeout_secs, check_timeout_secs,
+    check_request_timeout_secs, check_timeout_secs, resolve_tools,
 };
 use crate::pathutil::simplify_verbatim;
 
@@ -108,6 +108,7 @@ fn load_inner(path: &Path) -> Result<AgentConfig, ConfigError> {
     )?;
     let max_steps = check_max_steps(raw.limits.max_steps.unwrap_or(DEFAULT_MAX_STEPS))?;
     let timeout = check_timeout_secs(raw.limits.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))?;
+    let tools = resolve_tools(&raw.tools)?;
 
     let config_dir = absolute.parent().ok_or_else(|| ConfigError::Io {
         path: absolute.clone(),
@@ -127,6 +128,7 @@ fn load_inner(path: &Path) -> Result<AgentConfig, ConfigError> {
             request_timeout,
             connect_timeout,
         },
+        tools,
     ))
 }
 
@@ -296,6 +298,59 @@ mod tests {
             config.connect_timeout().as_secs(),
             DEFAULT_CONNECT_TIMEOUT_SECS
         );
+        assert!(config.tool_read_enabled());
+        assert!(config.tool_write_enabled());
+        assert!(config.require_write_approval());
+        assert_eq!(
+            config.tool_max_file_size_bytes(),
+            crate::DEFAULT_TOOL_MAX_FILE_SIZE_BYTES
+        );
+        assert_eq!(
+            config.tool_max_response_bytes(),
+            crate::DEFAULT_TOOL_MAX_RESPONSE_BYTES
+        );
+        assert_eq!(config.tool_max_search_matches(), 100);
+    }
+
+    #[test]
+    fn tools_section_rejects_disabled_approval_and_zero_limits() {
+        let root = TempDir::new("tools");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let base = toml_path(&workspace);
+        let disabled = write_config(
+            root.path(),
+            &format!("workspace_root = '{base}'\n[tools]\nrequire_write_approval = false\n"),
+        );
+        let error = load_from_path(&disabled).expect_err("approval");
+        assert_eq!(error.kind(), "invalid_value");
+        assert!(error.to_string().contains("cannot be disabled"), "{error}");
+
+        let zero = write_config(
+            root.path(),
+            &format!("workspace_root = '{base}'\n[tools]\nmax_file_size_bytes = 0\n"),
+        );
+        assert_eq!(
+            load_from_path(&zero).expect_err("zero").kind(),
+            "invalid_value"
+        );
+
+        let explicit = write_config(
+            root.path(),
+            &format!(
+                "workspace_root = '{base}'\n[tools]\nread_enabled = false\nwrite_enabled = true\nmax_file_size_bytes = 128\nmax_response_bytes = 64\nmax_directory_entries = 3\nmax_search_matches = 4\nmax_search_files = 5\nmax_search_total_bytes = 256\nrequire_write_approval = true\n"
+            ),
+        );
+        let config = load_from_path(&explicit).expect("explicit");
+        assert!(!config.tool_read_enabled());
+        assert!(config.tool_write_enabled());
+        assert!(config.require_write_approval());
+        assert_eq!(config.tool_max_file_size_bytes(), 128);
+        assert_eq!(config.tool_max_response_bytes(), 64);
+        assert_eq!(config.tool_max_directory_entries(), 3);
+        assert_eq!(config.tool_max_search_matches(), 4);
+        assert_eq!(config.tool_max_search_files(), 5);
+        assert_eq!(config.tool_max_search_total_bytes(), 256);
     }
 
     #[test]

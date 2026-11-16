@@ -458,10 +458,26 @@ mod tests {
             ToolEffect::ReadOnly,
         ))
         .expect("insert");
-        let denied = validate_batch(&read, &propose(vec![echo("hello")])).expect_err("permission");
-        assert_eq!(denied.kind(), "policy_denied");
+        let allowed = validate_batch(&read, &propose(vec![echo("hello")])).expect("workspace read");
+        assert_eq!(allowed.len(), 1);
         assert_eq!(
             authorize_proposal(read.get("diagnostic_echo").expect("tool")),
+            PolicyDecision::ProposalAllowed
+        );
+
+        let mut mismatched = ToolRegistry::empty();
+        mismatched
+            .insert(test_tool(
+                "diagnostic_echo",
+                PermissionCategory::WorkspaceRead,
+                ToolEffect::ApprovalRequired,
+            ))
+            .expect("insert");
+        let denied =
+            validate_batch(&mismatched, &propose(vec![echo("hello")])).expect_err("permission");
+        assert_eq!(denied.kind(), "policy_denied");
+        assert_eq!(
+            authorize_proposal(mismatched.get("diagnostic_echo").expect("tool")),
             PolicyDecision::Denied(PolicyDenyReason::PermissionNotGranted)
         );
     }

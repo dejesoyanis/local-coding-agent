@@ -2,14 +2,17 @@
 //!
 //! `status`, `config validate`, `workspace info`, and `tools probe` load configuration.
 //! Status probes Ollama and reports an unavailable server without panicking. `tools probe`
-//! validates a structured tool call. This binary does not start an agent loop and does not
-//! execute tools.
+//! validates a structured tool call and does not execute it. `tools list`, `tools read`,
+//! and `tools search` run inside the workspace sandbox. `tools patch prepare` writes only
+//! after a confirmation line read in that same process. This binary does not start an
+//! agent loop and does not run a shell.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod ask;
 mod probe;
+mod tools_cmd;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -53,6 +56,17 @@ pub enum Invocation {
     Buffered(CommandOutput),
     /// A prompt that must be streamed to the caller's stdout.
     Ask(AskCommand),
+    /// A patch preview that must be shown before the confirmation line is read.
+    Patch(PatchCommand),
+}
+
+/// Arguments for `lca tools patch prepare`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchCommand {
+    /// Configuration file selected by `--config`, or `lca.toml`.
+    pub config: PathBuf,
+    /// Workspace-relative unified diff.
+    pub patch_file: String,
 }
 
 /// Arguments for `lca ask`.
@@ -91,12 +105,29 @@ where
             model,
             prompt,
         }),
-        Command::Tools {
-            action: ToolsAction::Probe { protocol },
-        } => Invocation::Buffered(probe::run_probe(&probe::ProbeCommand {
-            config: config_path,
-            protocol: protocol.preference(),
-        })),
+        Command::Tools { action } => match action {
+            ToolsAction::Probe { protocol } => {
+                Invocation::Buffered(probe::run_probe(&probe::ProbeCommand {
+                    config: config_path,
+                    protocol: protocol.preference(),
+                }))
+            }
+            ToolsAction::List { path } => {
+                Invocation::Buffered(tools_cmd::run_list(&config_path, path.as_deref()))
+            }
+            ToolsAction::Read { path } => {
+                Invocation::Buffered(tools_cmd::run_read(&config_path, &path))
+            }
+            ToolsAction::Search { query, path } => {
+                Invocation::Buffered(tools_cmd::run_search(&config_path, &query, path.as_deref()))
+            }
+            ToolsAction::Patch {
+                action: PatchAction::Prepare { patch_file },
+            } => Invocation::Patch(PatchCommand {
+                config: config_path,
+                patch_file,
+            }),
+        },
     }
 }
 
@@ -116,10 +147,16 @@ where
             stdout: String::new(),
             stderr: "lca: ask is streamed by the lca binary\n".to_owned(),
         },
+        Invocation::Patch(_) => CommandOutput {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: "lca: patch prepare is confirmed by the lca binary\n".to_owned(),
+        },
     }
 }
 
 pub use ask::run_ask;
+pub use tools_cmd::run_patch_session;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -160,7 +197,7 @@ enum Command {
         #[arg(value_name = "PROMPT")]
         prompt: String,
     },
-    /// Inspect structured tool calling without executing a tool.
+    /// Probe tool calling or run a workspace filesystem tool.
     Tools {
         #[command(subcommand)]
         action: ToolsAction,
@@ -174,6 +211,38 @@ enum ToolsAction {
         /// `native`, `json`, or `auto`. The default is `auto`.
         #[arg(long, value_enum, default_value = "auto")]
         protocol: CliProtocol,
+    },
+    /// List one workspace directory. The listing is not recursive.
+    List {
+        /// Workspace-relative directory. Defaults to `.`.
+        path: Option<String>,
+    },
+    /// Read one UTF-8 file inside the workspace.
+    Read {
+        /// Workspace-relative path.
+        path: String,
+    },
+    /// Search workspace text for a literal query.
+    Search {
+        /// Literal text. Regular expressions are not evaluated.
+        query: String,
+        /// Workspace-relative directory. Defaults to `.`.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+    },
+    /// Prepare a single-file patch and ask for approval.
+    Patch {
+        #[command(subcommand)]
+        action: PatchAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PatchAction {
+    /// Show the diff and require an action-bound confirmation on stdin.
+    Prepare {
+        /// Workspace-relative unified diff.
+        patch_file: String,
     },
 }
 
@@ -369,6 +438,30 @@ fn push_summary(out: &mut String, config_path: &Path, config: &AgentConfig) {
         } else {
             "false"
         },
+    );
+    push_line(
+        out,
+        "tool_read_enabled",
+        if config.tool_read_enabled() {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    push_line(
+        out,
+        "tool_write_enabled",
+        if config.tool_write_enabled() {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    push_line(out, "require_write_approval", "true");
+    push_line(
+        out,
+        "max_file_size_bytes",
+        &config.tool_max_file_size_bytes().to_string(),
     );
 }
 

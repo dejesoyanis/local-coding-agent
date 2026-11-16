@@ -1,0 +1,817 @@
+//! Single-file unified diff preparation and approval-gated application.
+//!
+//! Prepare reads the file and builds the new bytes in memory. It does not create a
+//! temporary file and it does not change the target. Apply writes only after a grant
+//! whose binding matches this prepared action, and only if the file identity and hash
+//! are still the ones that were prepared.
+
+use std::collections::HashSet;
+use std::fmt;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+use crate::fs::limits::FsLimits;
+use crate::fs_error::{FsError, display_path};
+use crate::pathutil::paths_equivalent;
+use crate::sandbox::{
+    FileIdentity, WorkspaceSandbox, create_new_nofollow, file_identity, is_reparse,
+    read_resolved_file,
+};
+
+/// In-process record of approval bindings that have already been used.
+///
+/// The record is not stored on disk. Ending the process drops every grant.
+#[derive(Debug, Default)]
+pub struct ApprovalLedger {
+    used: Mutex<HashSet<[u8; 32]>>,
+}
+
+impl ApprovalLedger {
+    /// An empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            used: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+/// Grant produced from a confirmation line and one prepared patch.
+///
+/// The value is not [`Clone`]. Applying it consumes the binding in the ledger.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ApprovalGrant {
+    action_id: u64,
+    binding: [u8; 32],
+}
+
+impl ApprovalGrant {
+    /// Issues a grant when `line` is exactly the prepared confirmation line.
+    ///
+    /// A mismatched line, including model text that merely contains the word approve,
+    /// is rejected. This function does not write.
+    pub fn issue(prepared: &PreparedPatch, line: &str) -> Result<Self, FsError> {
+        if line != prepared.confirmation_line() {
+            return Err(FsError::ApprovalRejected);
+        }
+        Ok(Self {
+            action_id: prepared.action_id,
+            binding: prepared.binding,
+        })
+    }
+}
+
+/// A patch that has been applied in memory and is waiting for approval.
+pub struct PreparedPatch {
+    action_id: u64,
+    workspace_root: PathBuf,
+    relative_path: String,
+    identity: FileIdentity,
+    original_hash: [u8; 32],
+    new_hash: [u8; 32],
+    patch_hash: [u8; 32],
+    new_bytes: Vec<u8>,
+    patch_text: String,
+    diff: String,
+    binding: [u8; 32],
+    line_ending: &'static str,
+}
+
+impl fmt::Debug for PreparedPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedPatch")
+            .field("action_id", &self.action_id)
+            .field("relative_path", &self.relative_path)
+            .field("original_hash", &hex_encode(&self.original_hash))
+            .field("new_hash", &hex_encode(&self.new_hash))
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedPatch {
+    /// Controller action identity.
+    #[must_use]
+    pub const fn action_id(&self) -> u64 {
+        self.action_id
+    }
+
+    /// Canonical workspace root captured at prepare time.
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    /// Workspace-relative target.
+    #[must_use]
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    /// SHA-256 of the file bytes that were read.
+    #[must_use]
+    pub fn original_hash_hex(&self) -> String {
+        hex_encode(&self.original_hash)
+    }
+
+    /// SHA-256 of the bytes that would be written.
+    #[must_use]
+    pub fn new_hash_hex(&self) -> String {
+        hex_encode(&self.new_hash)
+    }
+
+    /// Unified diff preview. The envelope uses LF. File bytes keep `line_ending`.
+    #[must_use]
+    pub fn diff(&self) -> &str {
+        &self.diff
+    }
+
+    /// `lf` or `crlf`. Existing lines are not converted.
+    #[must_use]
+    pub const fn line_ending(&self) -> &'static str {
+        self.line_ending
+    }
+
+    /// Exact line the user must type to approve this action.
+    #[must_use]
+    pub fn confirmation_line(&self) -> String {
+        format!(
+            "approve {} {}",
+            self.action_id,
+            &hex_encode(&self.binding)[..16]
+        )
+    }
+}
+
+/// Result of a successful apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyResult {
+    /// Workspace-relative path.
+    pub path: String,
+    /// SHA-256 of the bytes read back after the replace.
+    pub new_hash: String,
+}
+
+pub(crate) fn prepare_patch(
+    sandbox: &WorkspaceSandbox,
+    limits: &FsLimits,
+    action_id: u64,
+    path: &str,
+    patch: &str,
+) -> Result<PreparedPatch, FsError> {
+    if !limits.write_enabled() {
+        return Err(FsError::ToolDisabled {
+            tool: "apply_patch".to_owned(),
+        });
+    }
+    if patch.len() > 64 * 1024 {
+        return Err(FsError::InvalidPatch {
+            message: "patch text exceeds 65536 bytes".to_owned(),
+        });
+    }
+    let (header_path, hunks) = parse_unified(patch)?;
+    if !paths_match(&header_path, path) {
+        return Err(FsError::InvalidPatch {
+            message: "patch path does not match the requested path".to_owned(),
+        });
+    }
+    let resolved = sandbox.resolve(path)?;
+    if !resolved.is_file() {
+        return Err(FsError::NotAFile {
+            path: display_path(path),
+        });
+    }
+    if contains_protected(resolved.relative()) {
+        return Err(FsError::ProtectedPath {
+            path: resolved.relative().to_owned(),
+        });
+    }
+    let original = read_resolved_file(&resolved, limits.max_file_size_bytes())?;
+    let text = decode_text(&original, resolved.relative())?;
+    let (ending, lines) = split_source(text)?;
+    let updated = apply_hunks(&lines, &hunks)?;
+    let new_text = join_lines(&updated, ending);
+    let new_bytes = new_text.into_bytes();
+    if new_bytes.len() as u64 > limits.max_file_size_bytes() {
+        return Err(FsError::TooLarge {
+            path: resolved.relative().to_owned(),
+            limit: limits.max_file_size_bytes(),
+        });
+    }
+    let original_hash = sha256(&original);
+    let new_hash = sha256(&new_bytes);
+    let patch_hash = sha256(patch.as_bytes());
+    let binding = compute_binding(
+        action_id,
+        &sandbox.root().to_string_lossy(),
+        resolved.relative(),
+        resolved.identity(),
+        &original_hash,
+        &new_hash,
+        &patch_hash,
+    );
+    let diff = render_diff(resolved.relative(), &hunks);
+    Ok(PreparedPatch {
+        action_id,
+        workspace_root: sandbox.root().to_path_buf(),
+        relative_path: resolved.relative().to_owned(),
+        identity: resolved.identity(),
+        original_hash,
+        new_hash,
+        patch_hash,
+        new_bytes,
+        patch_text: patch.to_owned(),
+        diff,
+        binding,
+        line_ending: ending.label(),
+    })
+}
+
+pub(crate) fn apply_granted(
+    sandbox: &WorkspaceSandbox,
+    prepared: &PreparedPatch,
+    grant: ApprovalGrant,
+    ledger: &ApprovalLedger,
+) -> Result<ApplyResult, FsError> {
+    if grant.action_id != prepared.action_id || grant.binding != prepared.binding {
+        return Err(FsError::ApprovalMismatch);
+    }
+    if sha256(prepared.patch_text.as_bytes()) != prepared.patch_hash {
+        return Err(FsError::ApprovalMismatch);
+    }
+    if !paths_equivalent(sandbox.root(), &prepared.workspace_root) {
+        return Err(FsError::ApprovalMismatch);
+    }
+    let mut used = ledger.used.lock().map_err(|_| FsError::LedgerUnavailable)?;
+    if used.contains(&prepared.binding) {
+        return Err(FsError::ApprovalConsumed);
+    }
+    let resolved = sandbox.resolve(&prepared.relative_path)?;
+    if !resolved.is_file() {
+        return Err(FsError::NotAFile {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    if resolved.identity() != prepared.identity {
+        return Err(FsError::IdentityChanged {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    let current = read_capped(&resolved, &prepared.relative_path)?;
+    if sha256(&current) != prepared.original_hash {
+        return Err(FsError::Conflict {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    let text = decode_text(&current, &prepared.relative_path)?;
+    let (ending, lines) = split_source(text)?;
+    let (_header, hunks) = parse_unified(&prepared.patch_text)?;
+    let updated = apply_hunks(&lines, &hunks)?;
+    let replay = join_lines(&updated, ending).into_bytes();
+    if replay != prepared.new_bytes || sha256(&replay) != prepared.new_hash {
+        return Err(FsError::Conflict {
+            path: prepared.relative_path.clone(),
+        });
+    }
+
+    let parent = resolved
+        .absolute()
+        .parent()
+        .ok_or_else(|| FsError::WriteFailed {
+            path: prepared.relative_path.clone(),
+            message: "target has no parent directory".to_owned(),
+        })?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = parent.join(format!(
+        ".lca-apply-{}-{}-{nanos}.tmp",
+        prepared.action_id,
+        std::process::id()
+    ));
+    let mut temp = create_new_nofollow(&temp_path).map_err(|error| FsError::WriteFailed {
+        path: prepared.relative_path.clone(),
+        message: error.to_string(),
+    })?;
+    let temp_meta = temp.metadata().map_err(|error| FsError::WriteFailed {
+        path: prepared.relative_path.clone(),
+        message: error.to_string(),
+    })?;
+    if is_reparse(&temp_meta) {
+        drop(temp);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(FsError::ReparseDenied {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    let mut cleanup = TempCleanup {
+        path: &temp_path,
+        armed: true,
+    };
+    temp.write_all(&prepared.new_bytes)
+        .map_err(|error| FsError::WriteFailed {
+            path: prepared.relative_path.clone(),
+            message: error.to_string(),
+        })?;
+    temp.sync_all().map_err(|error| FsError::WriteFailed {
+        path: prepared.relative_path.clone(),
+        message: error.to_string(),
+    })?;
+    drop(temp);
+
+    let again = std::fs::symlink_metadata(resolved.absolute()).map_err(|error| FsError::Io {
+        path: prepared.relative_path.clone(),
+        message: error.to_string(),
+    })?;
+    if is_reparse(&again) || file_identity(&again, &prepared.relative_path)? != prepared.identity {
+        return Err(FsError::IdentityChanged {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    let reread = read_capped(&resolved, &prepared.relative_path)?;
+    if sha256(&reread) != prepared.original_hash {
+        return Err(FsError::Conflict {
+            path: prepared.relative_path.clone(),
+        });
+    }
+
+    used.insert(prepared.binding);
+    std::fs::rename(&temp_path, resolved.absolute()).map_err(|error| FsError::WriteFailed {
+        path: prepared.relative_path.clone(),
+        message: error.to_string(),
+    })?;
+    cleanup.armed = false;
+
+    let written = sandbox.resolve(&prepared.relative_path)?;
+    let bytes = read_resolved_file(&written, READ_CAP).map_err(|_| FsError::VerifyFailed {
+        path: prepared.relative_path.clone(),
+    })?;
+    if sha256(&bytes) != prepared.new_hash {
+        return Err(FsError::VerifyFailed {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    Ok(ApplyResult {
+        path: prepared.relative_path.clone(),
+        new_hash: hex_encode(&prepared.new_hash),
+    })
+}
+
+const READ_CAP: u64 = 16 * 1024 * 1024;
+
+fn read_capped(resolved: &crate::sandbox::ResolvedPath, path: &str) -> Result<Vec<u8>, FsError> {
+    match read_resolved_file(resolved, READ_CAP) {
+        Ok(bytes) => Ok(bytes),
+        Err(FsError::TooLarge { .. }) => Err(FsError::Conflict {
+            path: path.to_owned(),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode_text<'a>(bytes: &'a [u8], path: &str) -> Result<&'a str, FsError> {
+    if bytes.contains(&0) {
+        return Err(FsError::BinaryFile {
+            path: path.to_owned(),
+        });
+    }
+    std::str::from_utf8(bytes).map_err(|_| FsError::InvalidUtf8 {
+        path: path.to_owned(),
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "lf",
+            Self::Crlf => "crlf",
+        }
+    }
+}
+
+fn split_source(text: &str) -> Result<(LineEnding, Vec<String>), FsError> {
+    if text.is_empty() {
+        return Ok((LineEnding::Lf, Vec::new()));
+    }
+    let ending = classify_ending(text)?;
+    let separator = ending.as_str();
+    if !text.ends_with(separator) {
+        return Err(FsError::UnsupportedLayout {
+            message: "file does not end with its line ending".to_owned(),
+        });
+    }
+    let trimmed = &text[..text.len() - separator.len()];
+    if trimmed.is_empty() {
+        return Ok((ending, vec![String::new()]));
+    }
+    Ok((
+        ending,
+        trimmed.split(separator).map(str::to_owned).collect(),
+    ))
+}
+
+fn classify_ending(text: &str) -> Result<LineEnding, FsError> {
+    let crlf = text.contains("\r\n");
+    let stripped = text.replace("\r\n", "");
+    if stripped.contains('\r') || (crlf && stripped.contains('\n')) {
+        return Err(FsError::UnsupportedLayout {
+            message: "mixed line endings are rejected".to_owned(),
+        });
+    }
+    if crlf {
+        Ok(LineEnding::Crlf)
+    } else if text.contains('\n') {
+        Ok(LineEnding::Lf)
+    } else {
+        Err(FsError::UnsupportedLayout {
+            message: "file has no trailing newline".to_owned(),
+        })
+    }
+}
+
+fn join_lines(lines: &[String], ending: LineEnding) -> String {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push_str(ending.as_str());
+    }
+    out
+}
+
+enum HunkLine {
+    Context(String),
+    Delete(String),
+    Add(String),
+}
+
+struct Hunk {
+    old_start: usize,
+    old_len: usize,
+    new_len: usize,
+    lines: Vec<HunkLine>,
+}
+
+fn apply_hunks(lines: &[String], hunks: &[Hunk]) -> Result<Vec<String>, FsError> {
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+    for hunk in hunks {
+        let start = if hunk.old_len == 0 {
+            hunk.old_start
+        } else {
+            hunk.old_start
+                .checked_sub(1)
+                .ok_or_else(|| FsError::InvalidPatch {
+                    message: "hunk start is zero".to_owned(),
+                })?
+        };
+        if start < cursor || start > lines.len() {
+            return Err(FsError::ContextMismatch {
+                message: "hunk does not line up with the file".to_owned(),
+            });
+        }
+        output.extend(lines[cursor..start].iter().cloned());
+        cursor = start;
+        let mut old_seen = 0usize;
+        let mut new_seen = 0usize;
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(text) | HunkLine::Delete(text) => {
+                    let current = lines.get(cursor).ok_or_else(|| FsError::ContextMismatch {
+                        message: format!("missing context around line {}", cursor + 1),
+                    })?;
+                    if current != text {
+                        return Err(FsError::ContextMismatch {
+                            message: format!("context mismatch around line {}", cursor + 1),
+                        });
+                    }
+                    if matches!(line, HunkLine::Context(_)) {
+                        output.push(current.clone());
+                        new_seen += 1;
+                    }
+                    cursor += 1;
+                    old_seen += 1;
+                }
+                HunkLine::Add(text) => {
+                    if text.contains('\n') || text.contains('\r') {
+                        return Err(FsError::InvalidPatch {
+                            message: "added line contains a newline".to_owned(),
+                        });
+                    }
+                    output.push(text.clone());
+                    new_seen += 1;
+                }
+            }
+        }
+        if old_seen != hunk.old_len || new_seen != hunk.new_len {
+            return Err(FsError::InvalidPatch {
+                message: "hunk line counts do not match the header".to_owned(),
+            });
+        }
+    }
+    output.extend(lines[cursor..].iter().cloned());
+    Ok(output)
+}
+
+fn parse_unified(patch: &str) -> Result<(String, Vec<Hunk>), FsError> {
+    let mut lines: Vec<&str> = patch.split('\n').collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    if lines.len() < 3 {
+        return Err(FsError::InvalidPatch {
+            message: "patch is missing a file header".to_owned(),
+        });
+    }
+    let old_header = lines[0].trim_end_matches('\r');
+    let new_header = lines[1].trim_end_matches('\r');
+    let old_path = old_header
+        .strip_prefix("--- ")
+        .ok_or_else(|| FsError::InvalidPatch {
+            message: "patch must start with a --- header".to_owned(),
+        })?;
+    let new_path = new_header
+        .strip_prefix("+++ ")
+        .ok_or_else(|| FsError::InvalidPatch {
+            message: "patch is missing a +++ header".to_owned(),
+        })?;
+    if old_path == "/dev/null" || new_path == "/dev/null" {
+        return Err(FsError::InvalidPatch {
+            message: "creating or deleting a file is not supported".to_owned(),
+        });
+    }
+    let old_rel = strip_diff_prefix(old_path);
+    let new_rel = strip_diff_prefix(new_path);
+    if !paths_match(old_rel, new_rel) {
+        return Err(FsError::InvalidPatch {
+            message: "patch headers name different paths".to_owned(),
+        });
+    }
+    let mut hunks = Vec::new();
+    let mut index = 2;
+    while index < lines.len() {
+        let header = lines[index].trim_end_matches('\r');
+        if header.is_empty() {
+            return Err(FsError::InvalidPatch {
+                message: "unexpected blank line in the patch".to_owned(),
+            });
+        }
+        let (old_start, old_len, new_len) = parse_hunk_header(header)?;
+        index += 1;
+        let mut body = Vec::new();
+        let mut old_seen = 0usize;
+        let mut new_seen = 0usize;
+        while index < lines.len() && (old_seen < old_len || new_seen < new_len) {
+            let raw = lines[index].trim_end_matches('\r');
+            index += 1;
+            if raw.starts_with('\\') {
+                return Err(FsError::UnsupportedLayout {
+                    message: "newline markers in the diff are rejected".to_owned(),
+                });
+            }
+            let (prefix, text) = raw
+                .split_at_checked(1)
+                .ok_or_else(|| FsError::InvalidPatch {
+                    message: "hunk line is missing a prefix".to_owned(),
+                })?;
+            match prefix {
+                " " => {
+                    body.push(HunkLine::Context(text.to_owned()));
+                    old_seen += 1;
+                    new_seen += 1;
+                }
+                "-" => {
+                    body.push(HunkLine::Delete(text.to_owned()));
+                    old_seen += 1;
+                }
+                "+" => {
+                    body.push(HunkLine::Add(text.to_owned()));
+                    new_seen += 1;
+                }
+                _ => {
+                    return Err(FsError::InvalidPatch {
+                        message: "hunk line prefix is not space, plus, or minus".to_owned(),
+                    });
+                }
+            }
+        }
+        if old_seen != old_len || new_seen != new_len {
+            return Err(FsError::InvalidPatch {
+                message: "hunk ended before its header counts were satisfied".to_owned(),
+            });
+        }
+        hunks.push(Hunk {
+            old_start,
+            old_len,
+            new_len,
+            lines: body,
+        });
+    }
+    if hunks.is_empty() {
+        return Err(FsError::InvalidPatch {
+            message: "patch contains no hunks".to_owned(),
+        });
+    }
+    Ok((old_rel.to_owned(), hunks))
+}
+
+fn parse_hunk_header(header: &str) -> Result<(usize, usize, usize), FsError> {
+    let rest = header
+        .strip_prefix("@@ ")
+        .ok_or_else(|| FsError::InvalidPatch {
+            message: "hunk header is malformed".to_owned(),
+        })?;
+    let (ranges, _) = rest
+        .split_once(" @@")
+        .ok_or_else(|| FsError::InvalidPatch {
+            message: "hunk header is malformed".to_owned(),
+        })?;
+    let mut parts = ranges.split_whitespace();
+    let old = parts.next().ok_or_else(|| FsError::InvalidPatch {
+        message: "hunk header is missing the old range".to_owned(),
+    })?;
+    let new = parts.next().ok_or_else(|| FsError::InvalidPatch {
+        message: "hunk header is missing the new range".to_owned(),
+    })?;
+    if parts.next().is_some() {
+        return Err(FsError::InvalidPatch {
+            message: "hunk header has extra fields".to_owned(),
+        });
+    }
+    let old = old.strip_prefix('-').ok_or_else(|| FsError::InvalidPatch {
+        message: "hunk old range is malformed".to_owned(),
+    })?;
+    let new = new.strip_prefix('+').ok_or_else(|| FsError::InvalidPatch {
+        message: "hunk new range is malformed".to_owned(),
+    })?;
+    let (old_start, old_len) = parse_range(old)?;
+    let (_new_start, new_len) = parse_range(new)?;
+    if old_len == 0 && old_start > 1_000_000 {
+        return Err(FsError::InvalidPatch {
+            message: "hunk start is too large".to_owned(),
+        });
+    }
+    Ok((old_start, old_len, new_len))
+}
+
+fn parse_range(text: &str) -> Result<(usize, usize), FsError> {
+    let (start_text, len_text) = text.split_once(',').unwrap_or((text, "1"));
+    let start = start_text
+        .parse::<usize>()
+        .map_err(|_| FsError::InvalidPatch {
+            message: "hunk range is not an integer".to_owned(),
+        })?;
+    let len = len_text
+        .parse::<usize>()
+        .map_err(|_| FsError::InvalidPatch {
+            message: "hunk range is not an integer".to_owned(),
+        })?;
+    Ok((start, len))
+}
+
+fn strip_diff_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+fn paths_match(left: &str, right: &str) -> bool {
+    let left: Vec<&str> = left
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let right: Vec<&str> = right
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter().zip(right.iter()).all(|(left, right)| {
+        #[cfg(windows)]
+        {
+            left.eq_ignore_ascii_case(right)
+        }
+        #[cfg(not(windows))]
+        {
+            left == right
+        }
+    })
+}
+
+fn contains_protected(relative: &str) -> bool {
+    relative
+        .split('/')
+        .any(|part| part.eq_ignore_ascii_case(".git") || part.eq_ignore_ascii_case("target"))
+}
+
+fn render_diff(path: &str, hunks: &[Hunk]) -> String {
+    let mut out = String::new();
+    out.push_str("--- a/");
+    out.push_str(path);
+    out.push('\n');
+    out.push_str("+++ b/");
+    out.push_str(path);
+    out.push('\n');
+    let mut new_cursor = 1usize;
+    for hunk in hunks {
+        let new_start = if hunk.new_len == 0 { 0 } else { new_cursor };
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            hunk.old_start, hunk.old_len, new_start, hunk.new_len
+        ));
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(text) => {
+                    out.push(' ');
+                    out.push_str(text);
+                    new_cursor += 1;
+                }
+                HunkLine::Delete(text) => {
+                    out.push('-');
+                    out.push_str(text);
+                }
+                HunkLine::Add(text) => {
+                    out.push('+');
+                    out.push_str(text);
+                    new_cursor += 1;
+                }
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn compute_binding(
+    action_id: u64,
+    workspace: &str,
+    relative: &str,
+    identity: FileIdentity,
+    original_hash: &[u8; 32],
+    new_hash: &[u8; 32],
+    patch_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut buffer = Vec::new();
+    push_part(&mut buffer, b"LCA-01D-APPROVAL-V1");
+    push_part(&mut buffer, &action_id.to_le_bytes());
+    push_part(&mut buffer, workspace.as_bytes());
+    push_part(&mut buffer, relative.as_bytes());
+    push_part(&mut buffer, &identity.created().to_le_bytes());
+    push_part(&mut buffer, &identity.modified().to_le_bytes());
+    push_part(&mut buffer, &identity.len().to_le_bytes());
+    push_part(&mut buffer, original_hash);
+    push_part(&mut buffer, new_hash);
+    push_part(&mut buffer, patch_hash);
+    sha256(&buffer)
+}
+
+fn push_part(buffer: &mut Vec<u8>, part: &[u8]) {
+    let len = u64::try_from(part.len()).unwrap_or(u64::MAX);
+    buffer.extend_from_slice(&len.to_le_bytes());
+    buffer.extend_from_slice(part);
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+struct TempCleanup<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+impl Drop for TempCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}

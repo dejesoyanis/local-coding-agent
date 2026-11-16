@@ -12,7 +12,18 @@ fn main() -> ExitCode {
     match lca_cli::interpret(std::env::args_os()) {
         lca_cli::Invocation::Buffered(output) => write_buffered(output),
         lca_cli::Invocation::Ask(command) => stream_ask(command),
+        lca_cli::Invocation::Patch(command) => confirm_patch(command),
     }
+}
+
+fn confirm_patch(command: lca_cli::PatchCommand) -> ExitCode {
+    let code = lca_cli::run_patch_session(
+        &command,
+        &mut io::stdin().lock(),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    );
+    ExitCode::from(code)
 }
 
 fn write_buffered(output: lca_cli::CommandOutput) -> ExitCode {
