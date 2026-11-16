@@ -28,6 +28,25 @@ struct ChatPayload {
 struct ChatMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<OllamaToolCall>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    function: OllamaCalledFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaCalledFunction {
+    name: String,
+    arguments: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,12 +250,28 @@ fn mapped_messages(request: &GenerationRequest) -> Vec<ChatMessage> {
         messages.push(ChatMessage {
             role: "system".to_owned(),
             content: system.to_owned(),
+            tool_name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         });
     }
     for message in request.messages() {
         messages.push(ChatMessage {
             role: message.role().as_str().to_owned(),
             content: message.content().to_owned(),
+            tool_name: message.tool_name().map(ToOwned::to_owned),
+            tool_call_id: message.tool_call_id().map(ToOwned::to_owned),
+            tool_calls: message
+                .tool_calls()
+                .iter()
+                .map(|call| OllamaToolCall {
+                    id: call.id().map(ToOwned::to_owned),
+                    function: OllamaCalledFunction {
+                        name: call.name().to_owned(),
+                        arguments: call.arguments().clone(),
+                    },
+                })
+                .collect(),
         });
     }
     messages
@@ -304,7 +339,16 @@ fn one_tool_call(value: &Value) -> Result<RawToolCall, RuntimeError> {
             ));
         }
     };
-    Ok(RawToolCall::new(name, arguments))
+    let id = call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let parsed = RawToolCall::new(name, arguments);
+    Ok(match id {
+        Some(id) => parsed.with_id(id),
+        None => parsed,
+    })
 }
 
 fn options_of(request: &GenerationRequest) -> Option<ChatOptions> {
@@ -773,8 +817,9 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name(), "diagnostic_echo");
         assert_eq!(calls[0].arguments()["message"], "one");
+        assert_eq!(calls[0].id(), Some("model-supplied"));
         assert_eq!(calls[1].arguments()["message"], "two");
-        assert!(!format!("{calls:?}").contains("model-supplied"));
+        assert_eq!(calls[1].id(), None);
     }
 
     #[test]
@@ -827,7 +872,8 @@ mod tests {
     #[test]
     fn observed_ollama_0_40_tool_call_shape_is_preserved() {
         // Captured from Ollama 0.40.16 with qwen3:8b, stream false.
-        // The model id and function index are not copied into the runtime call.
+        // The function index is not copied. The call id is kept so a later turn can
+        // associate the result. The id is not an authorization.
         let response = response_from_chat_json(
             br#"{"model":"qwen3:8b","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_yqfuarki","function":{"index":0,"name":"diagnostic_echo","arguments":{"message":"hello"}}}]},"done":true,"done_reason":"stop"}"#,
             "fallback",
@@ -836,7 +882,8 @@ mod tests {
         assert_eq!(response.tool_calls().len(), 1);
         assert_eq!(response.tool_calls()[0].name(), "diagnostic_echo");
         assert_eq!(response.tool_calls()[0].arguments()["message"], "hello");
-        assert!(!format!("{:?}", response.tool_calls()).contains("call_yqfuarki"));
+        assert_eq!(response.tool_calls()[0].id(), Some("call_yqfuarki"));
+        assert!(!format!("{:?}", response.tool_calls()).contains("\"index\""));
     }
 
     #[test]

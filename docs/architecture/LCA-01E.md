@@ -24,7 +24,7 @@ One `lca agent run` starts one non-streaming generation. The response may be tex
 `SingleTurnAgentController::run` accepts the prompt, then:
 
 1. Looks up capabilities (`POST /api/show` through the Ollama adapter). This is not a generation.
-2. Calls `select_protocol` once.
+2. Selects the protocol once. LCA-01F keeps this controller at one generation and routes that selection through `resolve_protocol_profile` and `select_protocol_with_profile`. `lca tools probe` still calls `select_protocol` and does not apply the profile.
 3. Calls `ModelRuntime::generate` once, with `stream` false.
 4. Interprets that response with the protocol that was selected.
 5. Validates the whole batch, then dispatches it, or returns the error.

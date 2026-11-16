@@ -126,6 +126,7 @@ impl ToolDefinition {
 pub struct RawToolCall {
     name: String,
     arguments: Value,
+    id: Option<String>,
 }
 
 impl RawToolCall {
@@ -135,7 +136,18 @@ impl RawToolCall {
         Self {
             name: name.into(),
             arguments,
+            id: None,
         }
+    }
+
+    /// Attaches a backend call id when the adapter preserved one.
+    ///
+    /// The id is not an authorization and it is not a controller action identity.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        self.id = if id.is_empty() { None } else { Some(id) };
+        self
     }
 
     /// Function name, unchanged from the backend.
@@ -148,6 +160,12 @@ impl RawToolCall {
     #[must_use]
     pub const fn arguments(&self) -> &Value {
         &self.arguments
+    }
+
+    /// Backend call id, when the adapter preserved one.
+    #[must_use]
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
 }
 

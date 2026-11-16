@@ -2,8 +2,17 @@ use serde_json::Value;
 
 use crate::action::model::ActionSource;
 
-/// Version of the JSON action document this milestone accepts.
+/// Version of the JSON action document LCA-01C accepts.
+///
+/// Version 1 contains only `protocol_version` and `actions`. [`parse_action_document`]
+/// still accepts only this version, so single-turn callers keep the LCA-01C contract.
 pub const PROTOCOL_VERSION: u64 = 1;
+
+/// Version of the multi-turn JSON document.
+///
+/// Version 2 adds an optional `final_answer` string. It is required when `actions` is
+/// empty and forbidden when `actions` is not empty. [`parse_action_document`] rejects it.
+pub const AGENT_PROTOCOL_VERSION: u64 = 2;
 
 /// Largest accepted JSON document, in bytes.
 pub const MAX_PROTOCOL_BYTES: usize = 64 * 1024;
@@ -36,6 +45,42 @@ impl ParsedAction {
     #[must_use]
     pub const fn source(&self) -> ActionSource {
         ActionSource::StructuredJson
+    }
+}
+
+/// One parsed JSON action document.
+///
+/// Version 1 has no [`Self::final_answer`]. Version 2 carries one only when `actions` is empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionDocument {
+    version: u64,
+    actions: Vec<ParsedAction>,
+    final_answer: Option<String>,
+}
+
+impl ActionDocument {
+    /// `protocol_version` from the document.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Actions in document order.
+    #[must_use]
+    pub fn actions(&self) -> &[ParsedAction] {
+        &self.actions
+    }
+
+    /// Final answer from protocol version 2. Absent on version 1.
+    #[must_use]
+    pub fn final_answer(&self) -> Option<&str> {
+        self.final_answer.as_deref()
+    }
+
+    /// Consumes the document and returns the actions.
+    #[must_use]
+    pub fn into_actions(self) -> Vec<ParsedAction> {
+        self.actions
     }
 }
 
@@ -100,6 +145,15 @@ pub enum JsonProtocolError {
         /// Number of actions in the document.
         actual: usize,
     },
+    /// `final_answer` is present together with one or more actions.
+    #[error("final_answer is only valid when actions is empty")]
+    FinalAnswerConflict,
+    /// `final_answer` is present and is not a string.
+    #[error("final_answer must be a string")]
+    InvalidFinalAnswer,
+    /// Protocol version 2 has an empty action list and no `final_answer`.
+    #[error("an empty action list requires final_answer")]
+    MissingFinalAnswer,
 }
 
 impl JsonProtocolError {
@@ -119,6 +173,9 @@ impl JsonProtocolError {
             Self::InvalidAction { .. } => "invalid_action",
             Self::InvalidActions => "invalid_actions",
             Self::TooManyActions { .. } => "too_many_actions",
+            Self::FinalAnswerConflict => "final_answer_conflict",
+            Self::InvalidFinalAnswer => "invalid_final_answer",
+            Self::MissingFinalAnswer => "missing_final_answer",
         }
     }
 }
@@ -128,6 +185,18 @@ impl JsonProtocolError {
 /// The input must be the whole response. Markdown fences are rejected before parsing.
 /// Invalid JSON is not repaired, and a JSON value embedded in prose is not extracted.
 pub fn parse_action_document(text: &str) -> Result<Vec<ParsedAction>, JsonProtocolError> {
+    Ok(decode_document(text, false)?.actions)
+}
+
+/// Parses a version 1 or version 2 action document.
+///
+/// This is the same decoder as [`parse_action_document`]. Version 2 is accepted only here
+/// so existing single-turn callers still reject `final_answer` and version 2.
+pub fn parse_agent_document(text: &str) -> Result<ActionDocument, JsonProtocolError> {
+    decode_document(text, true)
+}
+
+fn decode_document(text: &str, allow_v2: bool) -> Result<ActionDocument, JsonProtocolError> {
     if text.len() > MAX_PROTOCOL_BYTES {
         return Err(JsonProtocolError::TooLarge {
             limit: MAX_PROTOCOL_BYTES,
@@ -137,23 +206,28 @@ pub fn parse_action_document(text: &str) -> Result<Vec<ParsedAction>, JsonProtoc
         return Err(JsonProtocolError::MarkdownFence);
     }
     let value = serde_json::from_str::<Value>(text).map_err(|_| JsonProtocolError::InvalidJson)?;
-    interpret_document(value)
+    interpret_document(value, allow_v2)
 }
 
-fn interpret_document(value: Value) -> Result<Vec<ParsedAction>, JsonProtocolError> {
+fn interpret_document(value: Value, allow_v2: bool) -> Result<ActionDocument, JsonProtocolError> {
     let Some(object) = value.as_object() else {
         return Err(JsonProtocolError::NotAnObject);
     };
-    for key in object.keys() {
-        if key != "protocol_version" && key != "actions" {
-            return Err(JsonProtocolError::UnknownField { field: cap(key) });
-        }
-    }
-    let Some(version) = object.get("protocol_version") else {
+    let Some(version_value) = object.get("protocol_version") else {
         return Err(JsonProtocolError::MissingProtocolVersion);
     };
-    if serde_json::to_string(version).ok().as_deref() != Some("1") {
-        return Err(version_error(version));
+    let version = match version_token(version_value) {
+        Some(PROTOCOL_VERSION) => PROTOCOL_VERSION,
+        Some(AGENT_PROTOCOL_VERSION) if allow_v2 => AGENT_PROTOCOL_VERSION,
+        Some(_) | None => return Err(version_error(version_value)),
+    };
+    for key in object.keys() {
+        let allowed = key == "protocol_version"
+            || key == "actions"
+            || (version == AGENT_PROTOCOL_VERSION && key == "final_answer");
+        if !allowed {
+            return Err(JsonProtocolError::UnknownField { field: cap(key) });
+        }
     }
     let Some(actions) = object.get("actions") else {
         return Err(JsonProtocolError::MissingField { field: "actions" });
@@ -167,11 +241,39 @@ fn interpret_document(value: Value) -> Result<Vec<ParsedAction>, JsonProtocolErr
             actual: actions.len(),
         });
     }
-    actions
+    let parsed = actions
         .iter()
         .enumerate()
         .map(|(index, action)| parse_action(index, action))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let final_answer = match object.get("final_answer") {
+        None => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(JsonProtocolError::InvalidFinalAnswer),
+    };
+    if version == AGENT_PROTOCOL_VERSION {
+        if parsed.is_empty() && final_answer.is_none() {
+            return Err(JsonProtocolError::MissingFinalAnswer);
+        }
+        if !parsed.is_empty() && final_answer.is_some() {
+            return Err(JsonProtocolError::FinalAnswerConflict);
+        }
+    }
+    Ok(ActionDocument {
+        version,
+        actions: parsed,
+        final_answer,
+    })
+}
+
+fn version_token(version: &Value) -> Option<u64> {
+    let text = serde_json::to_string(version).ok()?;
+    let number = version.as_u64()?;
+    if text == number.to_string() {
+        Some(number)
+    } else {
+        None
+    }
 }
 
 fn version_error(version: &Value) -> JsonProtocolError {
@@ -319,5 +421,46 @@ mod tests {
         let document = json!({"protocol_version": 1, "actions": actions}).to_string();
         let error = parse_action_document(&document).expect_err("count");
         assert_eq!(error.kind(), "too_many_actions");
+    }
+
+    #[test]
+    fn version_two_accepts_a_final_answer_only_on_the_agent_decoder() {
+        let finished = r#"{"protocol_version":2,"actions":[],"final_answer":"done"}"#;
+        assert_eq!(
+            parse_action_document(finished)
+                .expect_err("single turn")
+                .kind(),
+            "unsupported_version"
+        );
+        let document = parse_agent_document(finished).expect("agent");
+        assert_eq!(document.version(), 2);
+        assert!(document.actions().is_empty());
+        assert_eq!(document.final_answer(), Some("done"));
+
+        let call = r#"{"protocol_version":2,"actions":[{"tool":"read_file","arguments":{"path":"a.rs"}}]}"#;
+        let document = parse_agent_document(call).expect("call");
+        assert_eq!(document.actions().len(), 1);
+        assert_eq!(document.final_answer(), None);
+
+        assert_eq!(
+            parse_agent_document(r#"{"protocol_version":2,"actions":[]}"#)
+                .expect_err("missing")
+                .kind(),
+            "missing_final_answer"
+        );
+        assert_eq!(
+            parse_agent_document(
+                r#"{"protocol_version":2,"actions":[{"tool":"read_file","arguments":{}}],"final_answer":"x"}"#
+            )
+            .expect_err("conflict")
+            .kind(),
+            "final_answer_conflict"
+        );
+        assert_eq!(
+            parse_agent_document(r#"{"protocol_version":1,"actions":[],"final_answer":"x"}"#)
+                .expect_err("v1 field")
+                .kind(),
+            "unknown_field"
+        );
     }
 }

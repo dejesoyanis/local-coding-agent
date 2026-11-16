@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use lca_model_runtime::{
     GenerationOptions, GenerationRequest, GenerationResponse, ModelRuntime, ProtocolAvailability,
     ProtocolPreference, ProtocolSelectionError, ResponseFormat, RuntimeError, SelectedProtocol,
-    ToolDefinition, select_protocol,
+    ToolDefinition, resolve_protocol_profile, select_protocol_with_profile,
 };
 use lca_tools::{
     ActionIdFactory, ActionSource, ActionValidationError, FsError, FsLimits, FsOutcome,
@@ -421,8 +421,10 @@ impl SingleTurnAgentController {
             .capabilities(&self.settings.model)
             .await
             .map_err(TurnError::Runtime)?;
-        select_protocol(
+        let profile = resolve_protocol_profile(&self.settings.model);
+        select_protocol_with_profile(
             self.settings.preference,
+            &profile,
             &capabilities,
             ProtocolAvailability::new(JSON_FALLBACK_ALLOWED),
         )
@@ -534,6 +536,10 @@ impl SingleTurnAgentController {
         }
         Ok(done)
     }
+}
+
+pub(crate) fn record_executed(action: &ValidatedAction, outcome: FsOutcome) -> ExecutedAction {
+    executed(action, outcome)
 }
 
 fn executed(action: &ValidatedAction, outcome: FsOutcome) -> ExecutedAction {
@@ -862,6 +868,36 @@ mod tests {
 
     fn request_of(runtime: &MockRuntime) -> GenerationRequest {
         runtime.last.lock().expect("lock").clone().expect("request")
+    }
+
+    #[tokio::test]
+    async fn auto_for_the_registered_model_selects_json_without_a_second_protocol() {
+        let root = TempDir::new();
+        let runtime = mock(
+            CapabilityStatus::Confirmed,
+            CapabilityStatus::Unknown,
+            response(Vec::new(), r#"{"protocol_version":1,"actions":[]}"#),
+        );
+        let agent = SingleTurnAgentController::new(
+            ToolRegistry::workspace().expect("registry"),
+            WorkspaceSandbox::new(&root.0).expect("sandbox"),
+            limits(true, true),
+            TurnSettings {
+                model: "lca-30b-agent".to_owned(),
+                ..settings(ProtocolPreference::Auto, 8)
+            },
+        )
+        .expect("controller");
+        let report = agent
+            .run(&runtime, "Was ist Ownership?", now())
+            .await
+            .expect("turn");
+        assert_one_turn(&runtime);
+        assert_eq!(report.protocol().as_str(), "json");
+        assert!(report.actions().is_empty());
+        let request = request_of(&runtime);
+        assert!(request.tools().is_empty());
+        assert_eq!(request.response_format(), ResponseFormat::Text);
     }
 
     #[tokio::test]

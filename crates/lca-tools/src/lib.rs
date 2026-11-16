@@ -21,11 +21,12 @@ mod pathutil;
 mod privacy;
 
 pub use action::{
-    ActionId, ActionIdFactory, ActionSource, ActionStatus, ActionValidationError, AgentAction,
-    JsonProtocolError, MAX_ACTIONS, MAX_ARGUMENT_BYTES, MAX_PROTOCOL_BYTES, PROTOCOL_VERSION,
-    ParsedAction, PermissionCategory, PolicyDecision, PolicyDenyReason, RegisteredTool,
-    RegistryError, ToolCall, ToolCallBatch, ToolEffect, ToolRegistry, ValidatedAction,
-    authorize_proposal, parse_action_document, propose_actions, validate_batch,
+    AGENT_PROTOCOL_VERSION, ActionDocument, ActionId, ActionIdFactory, ActionSource, ActionStatus,
+    ActionValidationError, AgentAction, JsonProtocolError, MAX_ACTIONS, MAX_ARGUMENT_BYTES,
+    MAX_PROTOCOL_BYTES, PROTOCOL_VERSION, ParsedAction, PermissionCategory, PolicyDecision,
+    PolicyDenyReason, RegisteredTool, RegistryError, ToolCall, ToolCallBatch, ToolEffect,
+    ToolRegistry, ValidatedAction, authorize_proposal, parse_action_document, parse_agent_document,
+    propose_actions, validate_batch,
 };
 pub use auth::{AuthorizationDecision, ToolAuthorization, WorkspaceScope};
 pub use error::{DenyReason, ToolError};

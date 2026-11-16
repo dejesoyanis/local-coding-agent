@@ -492,6 +492,49 @@ fn serve_routes(routes: &[(&str, u16, &str)]) -> (String, Arc<Mutex<Vec<String>>
     (format!("http://{address}"), captured)
 }
 
+fn serve_sequence(routes: &[(&str, u16, &str)]) -> (String, Arc<Mutex<Vec<String>>>) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let captured_thread = Arc::clone(&captured);
+    let routes: Vec<(u16, String)> = routes
+        .iter()
+        .map(|(_, status, body)| (*status, (*body).to_owned()))
+        .collect();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut served = 0usize;
+        while served < routes.len() && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let Ok(request) = read_http(&mut stream) else {
+                        continue;
+                    };
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let (status, body) = &routes[served];
+                    captured_thread.lock().expect("capture").push(text);
+                    let reason = if *status == 200 { "OK" } else { "Error" };
+                    let header = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                    served += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{address}"), captured)
+}
+
 #[test]
 fn filesystem_commands_stay_inside_the_workspace() {
     let workspace = TempDir::new("fs-cli");
@@ -630,6 +673,8 @@ fn agent_run_reads_a_file_from_one_native_model_call() {
     let output = run(&[
         "agent",
         "run",
+        "--protocol",
+        "native",
         "--config",
         config.to_str().expect("utf-8"),
         "Lies notes.txt",
@@ -708,6 +753,8 @@ fn agent_run_prepares_a_patch_without_writing() {
     let output = run(&[
         "agent",
         "run",
+        "--protocol",
+        "native",
         "--config",
         config.to_str().expect("utf-8"),
         "Andere notes.txt",
@@ -743,6 +790,8 @@ fn agent_run_rejects_an_unknown_tool_without_leaking_arguments() {
     let output = run(&[
         "agent",
         "run",
+        "--protocol",
+        "native",
         "--config",
         config.to_str().expect("utf-8"),
         "do something",
@@ -827,6 +876,8 @@ fn agent_run_stops_at_the_configured_action_limit() {
     let output = run(&[
         "agent",
         "run",
+        "--protocol",
+        "native",
         "--config",
         config.to_str().expect("utf-8"),
         "Lies beide Dateien",
@@ -961,4 +1012,225 @@ fn eval_tools_writes_a_read_only_report_and_does_not_leak_protected_bytes() {
         fs::read_to_string(workspace.path().join(".env")).expect("env"),
         "SENTINEL_DO_NOT_LEAK\n"
     );
+}
+
+#[test]
+fn agent_run_auto_selects_json_for_the_registered_model() {
+    let workspace = TempDir::new("agent-auto-json");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let document = r#"{"protocol_version":1,"actions":[]}"#;
+    let chat = chat_response(document, &[]);
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "run",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Erkläre Ownership.",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("protocol: json\n"), "{stdout}");
+    assert!(stdout.contains("actions: 0\n"), "{stdout}");
+    let requests = captured.lock().expect("capture").clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(!requests[1].contains("\"tools\""), "{}", requests[1]);
+}
+
+#[test]
+fn agent_execute_auto_answers_without_a_tool_and_can_print_json() {
+    let workspace = TempDir::new("execute-final");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let document = r#"{"protocol_version":2,"actions":[],"final_answer":"Ownership beschreibt, welcher Wert gültig ist."}"#;
+    let chat = chat_response(document, &[]);
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "execute",
+        "--output",
+        "json",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Erkläre Ownership.",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("\"protocol\":\"json\""), "{stdout}");
+    assert!(
+        stdout.contains("\"preferred_protocol\":\"json\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"status\":\"completed\""), "{stdout}");
+    assert!(stdout.contains("\"model_turns\":1"), "{stdout}");
+    assert!(stdout.contains("\"tool_actions\":0"), "{stdout}");
+    assert!(stdout.contains("Ownership beschreibt"), "{stdout}");
+    assert_eq!(captured.lock().expect("capture").len(), 2);
+}
+
+#[test]
+fn agent_execute_returns_a_read_before_the_final_answer() {
+    let workspace = TempDir::new("execute-read");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let read = r#"{"protocol_version":2,"actions":[{"tool":"read_file","arguments":{"path":"notes.txt"}}]}"#;
+    let done = r#"{"protocol_version":2,"actions":[],"final_answer":"Die Datei enthält alpha."}"#;
+    let (endpoint, captured) = serve_sequence(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat_response(read, &[])),
+        ("POST /api/chat", 200, &chat_response(done, &[])),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "execute",
+        "--protocol",
+        "json",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Lies notes.txt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("protocol: json\n"), "{stdout}");
+    assert!(stdout.contains("model_turns: 2\n"), "{stdout}");
+    assert!(stdout.contains("tool_actions: 1\n"), "{stdout}");
+    assert!(stdout.contains("tool: read_file\n"), "{stdout}");
+    assert!(stdout.contains("result: read\n"), "{stdout}");
+    assert!(stdout.contains("alpha\n"), "{stdout}");
+    assert!(stdout.contains("final_answer:\n"), "{stdout}");
+    let requests = captured.lock().expect("capture").clone();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(requests[2].contains("untrusted_data"), "{}", requests[2]);
+    assert!(!requests[2].contains("\"tools\""), "{}", requests[2]);
+}
+
+#[test]
+fn agent_execute_stops_at_one_turn_when_asked() {
+    let workspace = TempDir::new("execute-budget");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let read = r#"{"protocol_version":2,"actions":[{"tool":"read_file","arguments":{"path":"notes.txt"}}]}"#;
+    let chat = chat_response(read, &[]);
+    let (endpoint, captured) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = workspace.path().join("lca.toml");
+    let body = format!(
+        "workspace_root = '{}'\n[ollama]\nendpoint = '{endpoint}'\nmodel = 'lca-30b-agent'\nrequest_timeout_secs = 5\nconnect_timeout_secs = 1\n[limits]\nmax_steps = 32\n",
+        toml_path(workspace.path())
+    );
+    fs::write(&config, body).expect("config");
+    let output = run(&[
+        "agent",
+        "execute",
+        "--protocol",
+        "json",
+        "--max-turns",
+        "1",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Untersuche notes.txt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stdout.contains("model_turns: 1\n"), "{stdout}");
+    assert!(stdout.contains("stop_reason: turn_budget\n"), "{stdout}");
+    assert!(stdout.contains("tool: read_file\n"), "{stdout}");
+    assert!(!stdout.contains("final_answer:"), "{stdout}");
+    let chats = captured
+        .lock()
+        .expect("capture")
+        .iter()
+        .filter(|request| request.contains("POST /api/chat"))
+        .count();
+    assert_eq!(chats, 1);
+}
+
+#[test]
+fn agent_execute_prepares_a_patch_without_offering_a_later_grant() {
+    let workspace = TempDir::new("execute-patch");
+    fs::write(workspace.path().join("notes.txt"), "alpha\n").expect("notes");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let patch = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,1 +1,1 @@\n-alpha\n+beta\n";
+    let arguments = format!(
+        r#"{{"path":"notes.txt","patch":{}}}"#,
+        encode_json_string(patch)
+    );
+    let document = format!(
+        r#"{{"protocol_version":2,"actions":[{{"tool":"apply_patch","arguments":{arguments}}}]}}"#
+    );
+    let chat = chat_response(&document, &[]);
+    let (endpoint, _) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    let output = run(&[
+        "agent",
+        "execute",
+        "--protocol",
+        "json",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Ändere notes.txt",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("result: prepared\n"), "{stdout}");
+    assert!(stdout.contains("applied: false\n"), "{stdout}");
+    assert!(stdout.contains("approval: unavailable\n"), "{stdout}");
+    assert!(!stdout.contains("confirmation:"), "{stdout}");
+    assert!(!stdout.contains("approve "), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("notes.txt")).expect("unchanged"),
+        "alpha\n"
+    );
+}
+
+#[test]
+fn agent_execute_denies_a_protected_file_without_leaking_it() {
+    let workspace = TempDir::new("execute-privacy");
+    let show = r#"{"capabilities":["completion","tools"]}"#;
+    let document = r#"{"protocol_version":2,"actions":[{"tool":"read_file","arguments":{"path":"lca.toml"}}]}"#;
+    let chat = chat_response(document, &[]);
+    let (endpoint, _) = serve_routes(&[
+        ("POST /api/show", 200, show),
+        ("POST /api/chat", 200, &chat),
+    ]);
+    let config = workspace.path().join("lca.toml");
+    let body = format!(
+        "# SENTINEL_DO_NOT_LEAK\nworkspace_root = '{}'\n[ollama]\nendpoint = '{endpoint}'\nmodel = 'lca-30b-agent'\nrequest_timeout_secs = 5\nconnect_timeout_secs = 1\n",
+        toml_path(workspace.path())
+    );
+    fs::write(&config, body).expect("config");
+    let output = run(&[
+        "agent",
+        "execute",
+        "--protocol",
+        "auto",
+        "--config",
+        config.to_str().expect("utf-8"),
+        "Lies lca.toml",
+    ]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("protected"), "{stderr}");
+    assert!(!stdout.contains("SENTINEL_DO_NOT_LEAK"), "{stdout}");
+    assert!(!stderr.contains("SENTINEL_DO_NOT_LEAK"), "{stderr}");
+    assert!(stdout.contains("stop_reason: tool_error\n"), "{stdout}");
 }

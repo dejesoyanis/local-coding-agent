@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::capabilities::{CapabilityStatus, ModelCapabilities};
+use crate::profile::{ModelProtocolProfile, PreferredProtocol};
 
 /// Which tool protocol the controller asked for.
 ///
@@ -139,6 +140,54 @@ pub fn select_protocol(
     }
 }
 
+/// Chooses one protocol, applying a model profile when the preference is `auto`.
+///
+/// Explicit `native` and `json` preferences ignore the profile. `auto` uses
+/// [`ModelProtocolProfile::preferred`]. A failure here does not try the other protocol
+/// unless `fallback_eligible` is set, and it never tries again after a generation error.
+/// The caller must keep the returned protocol for the rest of the run.
+pub fn select_protocol_with_profile(
+    preference: ProtocolPreference,
+    profile: &ModelProtocolProfile,
+    capabilities: &ModelCapabilities,
+    availability: ProtocolAvailability,
+) -> Result<SelectedProtocol, ProtocolSelectionError> {
+    match preference {
+        ProtocolPreference::Native | ProtocolPreference::StructuredJson => {
+            select_protocol(preference, capabilities, availability)
+        }
+        ProtocolPreference::Auto => match profile.preferred() {
+            PreferredProtocol::Capability => {
+                select_protocol(ProtocolPreference::Auto, capabilities, availability)
+            }
+            PreferredProtocol::StructuredJson => prefer_then(
+                allowed_json(capabilities, availability),
+                || confirmed_native(capabilities),
+                profile,
+            ),
+            PreferredProtocol::Native => prefer_then(
+                confirmed_native(capabilities),
+                || allowed_json(capabilities, availability),
+                profile,
+            ),
+        },
+    }
+}
+
+fn prefer_then(
+    preferred: Result<SelectedProtocol, ProtocolSelectionError>,
+    other: impl FnOnce() -> Result<SelectedProtocol, ProtocolSelectionError>,
+    profile: &ModelProtocolProfile,
+) -> Result<SelectedProtocol, ProtocolSelectionError> {
+    match preferred {
+        Ok(selected) => Ok(selected),
+        Err(_) if profile.fallback_eligible() => {
+            other().map_err(|_| ProtocolSelectionError::NoProtocolAvailable)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn confirmed_native(
     capabilities: &ModelCapabilities,
 ) -> Result<SelectedProtocol, ProtocolSelectionError> {
@@ -237,5 +286,43 @@ mod tests {
         let error = select_protocol(ProtocolPreference::StructuredJson, &confirmed_json, blocked)
             .expect_err("disabled");
         assert_eq!(error, ProtocolSelectionError::JsonFallbackDisabled);
+    }
+
+    #[test]
+    fn auto_uses_the_profile_and_does_not_switch_after_selection() {
+        let allowed = ProtocolAvailability::new(true);
+        let blocked = ProtocolAvailability::new(false);
+        let confirmed = capabilities(CapabilityStatus::Confirmed, CapabilityStatus::Unknown);
+        let profile = crate::resolve_protocol_profile("lca-30b-agent");
+        let selected =
+            select_protocol_with_profile(ProtocolPreference::Auto, &profile, &confirmed, allowed)
+                .expect("json first");
+        assert_eq!(
+            selected,
+            SelectedProtocol::StructuredJson {
+                json_mode_confirmed: false
+            }
+        );
+        assert_eq!(
+            select_protocol_with_profile(
+                ProtocolPreference::Native,
+                &profile,
+                &confirmed,
+                allowed,
+            )
+            .expect("explicit native"),
+            SelectedProtocol::Native
+        );
+        let error =
+            select_protocol_with_profile(ProtocolPreference::Auto, &profile, &confirmed, blocked)
+                .expect_err("no silent native");
+        assert_eq!(error, ProtocolSelectionError::JsonFallbackDisabled);
+
+        let unknown = crate::resolve_protocol_profile("lca-agent");
+        assert_eq!(
+            select_protocol_with_profile(ProtocolPreference::Auto, &unknown, &confirmed, allowed)
+                .expect("capability native"),
+            SelectedProtocol::Native
+        );
     }
 }

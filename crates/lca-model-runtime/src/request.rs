@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use crate::error::RuntimeError;
-use crate::message::Message;
-use crate::tool::{MAX_TOOLS_PER_REQUEST, ResponseFormat, ToolDefinition};
+use crate::message::{Message, MessageRole};
+use crate::tool::{
+    MAX_NATIVE_TOOL_CALLS, MAX_TOOLS_PER_REQUEST, ResponseFormat, ToolDefinition, valid_tool_name,
+};
 
 /// Largest accepted model identifier, in bytes.
 pub const MAX_MODEL_NAME_LEN: usize = 256;
@@ -105,7 +107,7 @@ impl GenerationRequest {
             ));
         }
         for message in &self.messages {
-            validate_text(message.content(), "message content")?;
+            validate_message(message)?;
         }
         if let Some(max_tokens) = self.max_tokens
             && max_tokens == 0
@@ -254,6 +256,53 @@ fn validate_model(model: &str) -> Result<(), RuntimeError> {
         ));
     }
     Ok(())
+}
+
+fn validate_message(message: &Message) -> Result<(), RuntimeError> {
+    match message.role() {
+        MessageRole::Assistant if !message.tool_calls().is_empty() => {
+            if message.tool_calls().len() > MAX_NATIVE_TOOL_CALLS {
+                return Err(RuntimeError::invalid(
+                    "assistant message has too many tool calls",
+                ));
+            }
+            if !message.content().trim().is_empty() {
+                validate_text(message.content(), "message content")?;
+            }
+            if message.tool_name().is_some() || message.tool_call_id().is_some() {
+                return Err(RuntimeError::invalid(
+                    "assistant message cannot carry a tool result identity",
+                ));
+            }
+            Ok(())
+        }
+        MessageRole::Tool => {
+            validate_text(message.content(), "message content")?;
+            match message.tool_name() {
+                Some(name) if valid_tool_name(name) => {}
+                _ => {
+                    return Err(RuntimeError::invalid("tool message needs a tool name"));
+                }
+            }
+            if !message.tool_calls().is_empty() {
+                return Err(RuntimeError::invalid(
+                    "tool message cannot carry tool calls",
+                ));
+            }
+            Ok(())
+        }
+        MessageRole::System | MessageRole::User | MessageRole::Assistant => {
+            if message.tool_name().is_some()
+                || message.tool_call_id().is_some()
+                || !message.tool_calls().is_empty()
+            {
+                return Err(RuntimeError::invalid(
+                    "only assistant and tool messages carry tool metadata",
+                ));
+            }
+            validate_text(message.content(), "message content")
+        }
+    }
 }
 
 fn validate_text(value: &str, field: &str) -> Result<(), RuntimeError> {

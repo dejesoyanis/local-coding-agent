@@ -3,7 +3,7 @@ name = "lca-core"
 version.workspace = true
 edition.workspace = true
 publish = false
-description = "Domain types and the single-turn agent controller."
+description = "Domain types and the agent controllers."
 
 [dependencies]
 lca-model-runtime = { path = "../lca-model-runtime" }

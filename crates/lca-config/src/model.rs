@@ -22,7 +22,43 @@ pub const DEFAULT_GENERATION_LIMIT: u32 = 2048;
 pub const DEFAULT_MAX_STEPS: u32 = 32;
 
 /// Default overall agent timeout, in seconds.
+///
+/// This is the LCA-01A limit. The multi-turn run uses [`DEFAULT_AGENT_TIMEOUT_SECS`]
+/// and does not read this value as its turn budget.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// Default model turns for `agent execute`.
+pub const DEFAULT_AGENT_MAX_TURNS: u32 = 5;
+
+/// Default actions accepted from one model turn. The protocol cap is 8.
+pub const DEFAULT_AGENT_MAX_ACTIONS_PER_TURN: u32 = 8;
+
+/// Default actions accepted across one `agent execute` run.
+pub const DEFAULT_AGENT_MAX_ACTIONS_PER_RUN: u32 = 20;
+
+/// Default cumulative tool-result bytes returned to the model (512 KiB).
+pub const DEFAULT_AGENT_MAX_TOOL_RESULT_BYTES: u64 = 512 * 1024;
+
+/// Default conversation history retained for one run (1 MiB).
+pub const DEFAULT_AGENT_MAX_HISTORY_BYTES: u64 = 1024 * 1024;
+
+/// Default wall-clock budget for one `agent execute` run, in seconds.
+pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 180;
+
+/// Largest accepted model-turn budget. `limits.max_steps` cannot raise this.
+pub const MAX_AGENT_TURNS: u32 = 32;
+
+/// Largest accepted per-turn action budget. Matches the protocol cap.
+pub const MAX_AGENT_ACTIONS_PER_TURN: u32 = 8;
+
+/// Largest accepted per-run action budget.
+pub const MAX_AGENT_ACTIONS_PER_RUN: u32 = 64;
+
+/// Largest accepted tool-result budget, in bytes (8 MiB).
+pub const MAX_AGENT_TOOL_RESULT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Largest accepted conversation history, in bytes (8 MiB).
+pub const MAX_AGENT_HISTORY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Default per-request Ollama HTTP timeout, in seconds.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -99,6 +135,12 @@ pub struct AgentConfig {
     tool_max_search_files: usize,
     tool_max_search_total_bytes: u64,
     privacy_excludes: Vec<String>,
+    agent_max_turns: u32,
+    agent_max_actions_per_turn: u32,
+    agent_max_actions_per_run: u32,
+    agent_max_tool_result_bytes: u64,
+    agent_max_history_bytes: u64,
+    agent_timeout: Duration,
 }
 
 /// Values that are safe to print and to record in diagnostics.
@@ -144,6 +186,18 @@ pub struct ConfigSummary {
     pub tool_max_search_total_bytes: u64,
     /// Number of extra privacy exclusions. The mandatory baseline is not included.
     pub privacy_exclude_count: usize,
+    /// Model turns for `agent execute`. This is not `max_steps`.
+    pub agent_max_turns: u32,
+    /// Actions accepted from one model turn.
+    pub agent_max_actions_per_turn: u32,
+    /// Actions accepted across one `agent execute` run.
+    pub agent_max_actions_per_run: u32,
+    /// Cumulative tool-result bytes returned to the model.
+    pub agent_max_tool_result_bytes: u64,
+    /// Conversation history retained for one run, in bytes.
+    pub agent_max_history_bytes: u64,
+    /// Wall-clock budget for one `agent execute` run, in seconds.
+    pub agent_timeout_secs: u64,
 }
 
 impl AgentConfig {
@@ -153,6 +207,7 @@ impl AgentConfig {
         model: String,
         limits: ResolvedLimits,
         tools: ResolvedTools,
+        agent: ResolvedAgent,
     ) -> Self {
         Self {
             workspace_root,
@@ -174,6 +229,12 @@ impl AgentConfig {
             tool_max_search_files: tools.max_search_files,
             tool_max_search_total_bytes: tools.max_search_total_bytes,
             privacy_excludes: tools.privacy_excludes,
+            agent_max_turns: agent.max_turns,
+            agent_max_actions_per_turn: agent.max_actions_per_turn,
+            agent_max_actions_per_run: agent.max_actions_per_run,
+            agent_max_tool_result_bytes: agent.max_tool_result_bytes,
+            agent_max_history_bytes: agent.max_history_bytes,
+            agent_timeout: agent.timeout,
         }
     }
 
@@ -297,6 +358,46 @@ impl AgentConfig {
         &self.privacy_excludes
     }
 
+    /// Model turns for `agent execute`.
+    ///
+    /// `limits.max_steps` is the single-turn action cap used by `agent run`. It is not this value.
+    #[must_use]
+    pub const fn agent_max_turns(&self) -> u32 {
+        self.agent_max_turns
+    }
+
+    /// Actions accepted from one model turn during `agent execute`.
+    #[must_use]
+    pub const fn agent_max_actions_per_turn(&self) -> u32 {
+        self.agent_max_actions_per_turn
+    }
+
+    /// Actions accepted across one `agent execute` run.
+    #[must_use]
+    pub const fn agent_max_actions_per_run(&self) -> u32 {
+        self.agent_max_actions_per_run
+    }
+
+    /// Cumulative tool-result bytes that may be returned to the model.
+    #[must_use]
+    pub const fn agent_max_tool_result_bytes(&self) -> u64 {
+        self.agent_max_tool_result_bytes
+    }
+
+    /// Conversation history retained for one run, in bytes.
+    #[must_use]
+    pub const fn agent_max_history_bytes(&self) -> u64 {
+        self.agent_max_history_bytes
+    }
+
+    /// Wall-clock budget for one `agent execute` run.
+    ///
+    /// This is not [`Self::timeout`], which remains the LCA-01A agent timeout.
+    #[must_use]
+    pub const fn agent_timeout(&self) -> Duration {
+        self.agent_timeout
+    }
+
     /// Copy of the fields that diagnostics are allowed to show.
     #[must_use]
     pub fn summary(&self) -> ConfigSummary {
@@ -321,6 +422,12 @@ impl AgentConfig {
             tool_max_search_files: self.tool_max_search_files,
             tool_max_search_total_bytes: self.tool_max_search_total_bytes,
             privacy_exclude_count: self.privacy_excludes.len(),
+            agent_max_turns: self.agent_max_turns,
+            agent_max_actions_per_turn: self.agent_max_actions_per_turn,
+            agent_max_actions_per_run: self.agent_max_actions_per_run,
+            agent_max_tool_result_bytes: self.agent_max_tool_result_bytes,
+            agent_max_history_bytes: self.agent_max_history_bytes,
+            agent_timeout_secs: self.agent_timeout.as_secs(),
         }
     }
 }
@@ -335,6 +442,8 @@ pub(crate) struct RawConfig {
     pub(crate) limits: RawLimits,
     #[serde(default)]
     pub(crate) tools: RawTools,
+    #[serde(default)]
+    pub(crate) agent: RawAgent,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -352,6 +461,17 @@ pub(crate) struct RawOllama {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawLimits {
     pub(crate) max_steps: Option<u32>,
+    pub(crate) timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawAgent {
+    pub(crate) max_turns: Option<u32>,
+    pub(crate) max_actions_per_turn: Option<u32>,
+    pub(crate) max_actions_per_run: Option<u32>,
+    pub(crate) max_tool_result_bytes: Option<u64>,
+    pub(crate) max_history_bytes: Option<u64>,
     pub(crate) timeout_secs: Option<u64>,
 }
 
@@ -386,6 +506,15 @@ pub(crate) struct ResolvedTools {
 pub(crate) struct CheckedEndpoint {
     pub(crate) origin: String,
     pub(crate) loopback: bool,
+}
+
+pub(crate) struct ResolvedAgent {
+    pub(crate) max_turns: u32,
+    pub(crate) max_actions_per_turn: u32,
+    pub(crate) max_actions_per_run: u32,
+    pub(crate) max_tool_result_bytes: u64,
+    pub(crate) max_history_bytes: u64,
+    pub(crate) timeout: Duration,
 }
 
 pub(crate) struct ResolvedLimits {
@@ -502,6 +631,61 @@ pub(crate) fn check_generation_limit(value: u32, context_window: u32) -> Result<
         return Err(ConfigError::InvalidValue {
             field: "ollama.generation_limit",
             message: "must be from 1 through the context window".to_owned(),
+        });
+    }
+    Ok(value)
+}
+
+pub(crate) fn resolve_agent(raw: &RawAgent) -> Result<ResolvedAgent, ConfigError> {
+    Ok(ResolvedAgent {
+        max_turns: bounded_u32(
+            raw.max_turns.unwrap_or(DEFAULT_AGENT_MAX_TURNS),
+            MAX_AGENT_TURNS,
+            "agent.max_turns",
+        )?,
+        max_actions_per_turn: bounded_u32(
+            raw.max_actions_per_turn
+                .unwrap_or(DEFAULT_AGENT_MAX_ACTIONS_PER_TURN),
+            MAX_AGENT_ACTIONS_PER_TURN,
+            "agent.max_actions_per_turn",
+        )?,
+        max_actions_per_run: bounded_u32(
+            raw.max_actions_per_run
+                .unwrap_or(DEFAULT_AGENT_MAX_ACTIONS_PER_RUN),
+            MAX_AGENT_ACTIONS_PER_RUN,
+            "agent.max_actions_per_run",
+        )?,
+        max_tool_result_bytes: bounded_u64(
+            raw.max_tool_result_bytes
+                .unwrap_or(DEFAULT_AGENT_MAX_TOOL_RESULT_BYTES),
+            MAX_AGENT_TOOL_RESULT_BYTES,
+            "agent.max_tool_result_bytes",
+        )?,
+        max_history_bytes: bounded_u64(
+            raw.max_history_bytes
+                .unwrap_or(DEFAULT_AGENT_MAX_HISTORY_BYTES),
+            MAX_AGENT_HISTORY_BYTES,
+            "agent.max_history_bytes",
+        )?,
+        timeout: check_agent_timeout_secs(raw.timeout_secs.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS))?,
+    })
+}
+
+fn check_agent_timeout_secs(value: u64) -> Result<Duration, ConfigError> {
+    if value == 0 || value > MAX_TIMEOUT_SECS {
+        return Err(ConfigError::InvalidValue {
+            field: "agent.timeout_secs",
+            message: format!("must be from 1 through {MAX_TIMEOUT_SECS} seconds"),
+        });
+    }
+    Ok(Duration::from_secs(value))
+}
+
+fn bounded_u32(value: u32, max: u32, field: &'static str) -> Result<u32, ConfigError> {
+    if value == 0 || value > max {
+        return Err(ConfigError::InvalidValue {
+            field,
+            message: format!("must be from 1 through {max}"),
         });
     }
     Ok(value)

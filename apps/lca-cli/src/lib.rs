@@ -5,8 +5,8 @@
 //! validates a structured tool call and does not execute it. `tools list`, `tools read`,
 //! and `tools search` run inside the workspace sandbox. `tools patch prepare` writes only
 //! after a confirmation line read in that same process. `agent run` calls the model once
-//! and dispatches at most one validated tool batch. It does not start an agent loop, does
-//! not write, and does not run a shell.
+//! and dispatches at most one validated tool batch. `agent execute` may take several model
+//! turns inside fixed budgets. Neither command writes, and neither runs a shell.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -14,6 +14,7 @@
 mod agent;
 mod ask;
 mod eval_cmd;
+mod execute;
 mod probe;
 mod tools_cmd;
 
@@ -115,6 +116,23 @@ where
             protocol: protocol.preference(),
             prompt,
         })),
+        Command::Agent {
+            action:
+                AgentCli::Execute {
+                    protocol,
+                    max_turns,
+                    max_actions,
+                    output,
+                    prompt,
+                },
+        } => Invocation::Buffered(execute::run_execute(&execute::ExecuteCommand {
+            config: config_path,
+            protocol: protocol.preference(),
+            max_turns,
+            max_actions,
+            json: matches!(output, ExecuteFormat::Json),
+            prompt,
+        })),
         Command::Eval {
             action:
                 EvalCli::Tools {
@@ -211,7 +229,7 @@ enum Command {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
-    /// Run one model turn and dispatch a validated tool batch.
+    /// Run one model turn, or a bounded sequence of model turns.
     Agent {
         #[command(subcommand)]
         action: AgentCli,
@@ -248,6 +266,32 @@ enum AgentCli {
         #[arg(value_name = "PROMPT")]
         prompt: String,
     },
+    /// Run several model turns inside fixed budgets. A patch is prepared and not written.
+    Execute {
+        /// `native`, `json`, or `auto`. `auto` uses the model profile.
+        #[arg(long, value_enum, default_value = "auto")]
+        protocol: CliProtocol,
+        /// Model turns for this run. The default comes from `[agent]`.
+        #[arg(long, value_name = "N")]
+        max_turns: Option<u32>,
+        /// Actions across this run. The default comes from `[agent]`.
+        #[arg(long, value_name = "N")]
+        max_actions: Option<u32>,
+        /// `text` or `json`. The default is `text`.
+        #[arg(long, value_enum, default_value = "text")]
+        output: ExecuteFormat,
+        /// Task for the model.
+        #[arg(value_name = "PROMPT")]
+        prompt: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ExecuteFormat {
+    /// Line-oriented result.
+    Text,
+    /// One JSON object.
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -314,7 +358,7 @@ enum CliProtocol {
     Native,
     /// Versioned JSON action document.
     Json,
-    /// Native when confirmed, otherwise the JSON document.
+    /// Agent commands apply the model profile. The tools probe uses capability selection.
     Auto,
 }
 

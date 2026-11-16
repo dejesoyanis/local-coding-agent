@@ -8,7 +8,7 @@ use crate::model::{
     DEFAULT_MAX_STEPS, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL, DEFAULT_REQUEST_TIMEOUT_SECS,
     DEFAULT_TIMEOUT_SECS, MAX_CONFIG_BYTES, RawConfig, ResolvedLimits, check_connect_timeout_secs,
     check_context_window, check_endpoint, check_generation_limit, check_max_steps, check_model,
-    check_request_timeout_secs, check_timeout_secs, resolve_tools,
+    check_request_timeout_secs, check_timeout_secs, resolve_agent, resolve_tools,
 };
 use crate::pathutil::simplify_verbatim;
 
@@ -32,6 +32,14 @@ use crate::pathutil::simplify_verbatim;
 /// [limits]
 /// max_steps = 32
 /// timeout_secs = 300
+///
+/// [agent]
+/// max_turns = 5
+/// max_actions_per_turn = 8
+/// max_actions_per_run = 20
+/// max_tool_result_bytes = 524288
+/// max_history_bytes = 1048576
+/// timeout_secs = 180
 /// ```
 pub fn load_from_path(path: &Path) -> Result<AgentConfig, ConfigError> {
     match load_inner(path) {
@@ -109,6 +117,7 @@ fn load_inner(path: &Path) -> Result<AgentConfig, ConfigError> {
     let max_steps = check_max_steps(raw.limits.max_steps.unwrap_or(DEFAULT_MAX_STEPS))?;
     let timeout = check_timeout_secs(raw.limits.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))?;
     let tools = resolve_tools(&raw.tools)?;
+    let agent = resolve_agent(&raw.agent)?;
 
     let config_dir = absolute.parent().ok_or_else(|| ConfigError::Io {
         path: absolute.clone(),
@@ -129,6 +138,7 @@ fn load_inner(path: &Path) -> Result<AgentConfig, ConfigError> {
             connect_timeout,
         },
         tools,
+        agent,
     ))
 }
 
@@ -289,6 +299,27 @@ mod tests {
         assert!(config.loopback_endpoint());
         assert_eq!(config.generation_limit(), DEFAULT_GENERATION_LIMIT);
         assert_eq!(config.max_steps(), DEFAULT_MAX_STEPS);
+        assert_eq!(config.agent_max_turns(), crate::DEFAULT_AGENT_MAX_TURNS);
+        assert_eq!(
+            config.agent_max_actions_per_turn(),
+            crate::DEFAULT_AGENT_MAX_ACTIONS_PER_TURN
+        );
+        assert_eq!(
+            config.agent_max_actions_per_run(),
+            crate::DEFAULT_AGENT_MAX_ACTIONS_PER_RUN
+        );
+        assert_eq!(
+            config.agent_max_tool_result_bytes(),
+            crate::DEFAULT_AGENT_MAX_TOOL_RESULT_BYTES
+        );
+        assert_eq!(
+            config.agent_max_history_bytes(),
+            crate::DEFAULT_AGENT_MAX_HISTORY_BYTES
+        );
+        assert_eq!(
+            config.agent_timeout().as_secs(),
+            crate::DEFAULT_AGENT_TIMEOUT_SECS
+        );
         assert_eq!(config.timeout().as_secs(), DEFAULT_TIMEOUT_SECS);
         assert_eq!(
             config.request_timeout().as_secs(),
@@ -405,6 +436,29 @@ mod tests {
         assert_eq!(config.max_steps(), 4);
         assert_eq!(config.timeout().as_secs(), 60);
         assert_eq!(config.request_timeout().as_secs(), 9);
+        assert_eq!(config.agent_max_turns(), crate::DEFAULT_AGENT_MAX_TURNS);
+        assert_ne!(config.agent_max_turns(), config.max_steps());
+    }
+
+    #[test]
+    fn agent_section_does_not_read_max_steps_as_turns() {
+        let root = TempDir::new("agent-budget");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let body = format!(
+            "workspace_root = '{}'\n[limits]\nmax_steps = 32\n[agent]\nmax_turns = 3\nmax_actions_per_run = 9\ntimeout_secs = 90\n",
+            toml_path(&workspace)
+        );
+        let path = write_config(root.path(), &body);
+        let config = load_from_path(&path).expect("load");
+        assert_eq!(config.max_steps(), 32);
+        assert_eq!(config.agent_max_turns(), 3);
+        assert_eq!(config.agent_max_actions_per_run(), 9);
+        assert_eq!(
+            config.agent_max_actions_per_turn(),
+            crate::DEFAULT_AGENT_MAX_ACTIONS_PER_TURN
+        );
+        assert_eq!(config.agent_timeout().as_secs(), 90);
     }
 
     #[test]

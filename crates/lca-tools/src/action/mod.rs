@@ -20,7 +20,8 @@ mod schema;
 mod validate;
 
 pub use json_protocol::{
-    JsonProtocolError, MAX_PROTOCOL_BYTES, PROTOCOL_VERSION, ParsedAction, parse_action_document,
+    AGENT_PROTOCOL_VERSION, ActionDocument, JsonProtocolError, MAX_PROTOCOL_BYTES,
+    PROTOCOL_VERSION, ParsedAction, parse_action_document, parse_agent_document,
 };
 pub use model::{
     ActionId, ActionIdFactory, ActionSource, ActionStatus, AgentAction, ToolArguments, ToolCall,
