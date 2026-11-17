@@ -21,5 +21,8 @@ windows-sys = { version = "0.59", features = [
     "Wdk_Storage_FileSystem",
 ] }
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [lints.rust]
 unsafe_code = "deny"

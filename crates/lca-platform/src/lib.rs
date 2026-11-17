@@ -12,6 +12,9 @@ use std::path::Path;
 
 mod sys;
 
+#[cfg(all(test, windows))]
+mod publication_probe;
+
 /// Identity of one filesystem object, taken from an open handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectInfo {
