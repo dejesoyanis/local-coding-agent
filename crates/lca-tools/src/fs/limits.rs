@@ -31,11 +31,61 @@ const MAX_SEARCH_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// Hard cap on names held for one directory so a huge folder cannot exhaust memory.
 pub(crate) const MAX_DIRECTORY_SCAN: usize = 100_000;
 
+/// How far a trusted configuration allows a filesystem change to go.
+///
+/// The model cannot select this value. A missing configuration uses [`Self::ReadOnly`].
+/// [`Self::HumanApproved`] still requires a separate human confirmation before a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationMode {
+    /// `list_directory`, `read_file`, and `search_files` only.
+    ReadOnly,
+    /// Patch preparation and review. No apply and no restoration.
+    PrepareOnly,
+    /// Verified apply and restoration, each after its own human confirmation.
+    HumanApproved,
+}
+
+impl MutationMode {
+    /// Stable configuration and diagnostic name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::PrepareOnly => "prepare_only",
+            Self::HumanApproved => "human_approved",
+        }
+    }
+
+    /// Parses a trusted configuration value. Any other string is rejected.
+    #[must_use]
+    pub fn from_config_name(value: &str) -> Option<Self> {
+        match value {
+            "read_only" => Some(Self::ReadOnly),
+            "prepare_only" => Some(Self::PrepareOnly),
+            "human_approved" => Some(Self::HumanApproved),
+            _ => None,
+        }
+    }
+
+    /// Preparation of a patch in memory.
+    #[must_use]
+    pub const fn allows_prepare(self) -> bool {
+        matches!(self, Self::PrepareOnly | Self::HumanApproved)
+    }
+
+    /// A later human-confirmed write. This does not itself approve anything.
+    #[must_use]
+    pub const fn allows_human_mutation(self) -> bool {
+        matches!(self, Self::HumanApproved)
+    }
+}
+
 /// Limits that accompany one sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsLimits {
     read_enabled: bool,
     write_enabled: bool,
+    mutation_mode: MutationMode,
     max_file_size_bytes: u64,
     max_response_bytes: u64,
     max_directory_entries: usize,
@@ -72,6 +122,7 @@ impl FsLimits {
         Self {
             read_enabled: true,
             write_enabled: true,
+            mutation_mode: MutationMode::HumanApproved,
             max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_directory_entries: DEFAULT_MAX_DIRECTORY_ENTRIES,
@@ -105,9 +156,15 @@ impl FsLimits {
         {
             return Err(invalid_limit("max_search_total_bytes"));
         }
+        let mutation_mode = if values.write_enabled {
+            MutationMode::HumanApproved
+        } else {
+            MutationMode::ReadOnly
+        };
         Ok(Self {
             read_enabled: values.read_enabled,
             write_enabled: values.write_enabled,
+            mutation_mode,
             max_file_size_bytes: values.max_file_size_bytes,
             max_response_bytes: values.max_response_bytes,
             max_directory_entries: values.max_directory_entries,
@@ -120,11 +177,39 @@ impl FsLimits {
     /// Copy of these limits with patch preparation turned off.
     ///
     /// Read limits are unchanged. This does not grant a write and does not disable approval.
+    /// The mutation mode becomes [`MutationMode::ReadOnly`].
     #[must_use]
     pub fn read_only(&self) -> Self {
         let mut limits = self.clone();
         limits.write_enabled = false;
+        limits.mutation_mode = MutationMode::ReadOnly;
         limits
+    }
+
+    /// Replaces the mutation mode from trusted configuration.
+    ///
+    /// `write_enabled = false` cannot be raised by a mode. A mode cannot be taken from a
+    /// model argument.
+    #[must_use]
+    pub fn with_mutation_mode(mut self, mode: MutationMode) -> Self {
+        self.mutation_mode = if self.write_enabled {
+            mode
+        } else {
+            MutationMode::ReadOnly
+        };
+        self
+    }
+
+    /// Whether a patch may be prepared in memory.
+    #[must_use]
+    pub const fn allows_prepare(&self) -> bool {
+        self.write_enabled && self.mutation_mode.allows_prepare()
+    }
+
+    /// Whether a human confirmation may be honored for an apply or a restoration.
+    #[must_use]
+    pub const fn allows_human_mutation(&self) -> bool {
+        self.write_enabled && self.mutation_mode.allows_human_mutation()
     }
 
     #[must_use]
@@ -135,6 +220,12 @@ impl FsLimits {
     #[must_use]
     pub const fn write_enabled(&self) -> bool {
         self.write_enabled
+    }
+
+    /// Trusted mutation mode. This is not a model output.
+    #[must_use]
+    pub const fn mutation_mode(&self) -> MutationMode {
+        self.mutation_mode
     }
 
     #[must_use]
@@ -183,6 +274,20 @@ mod tests {
         let limits = FsLimits::conservative();
         assert!(limits.read_enabled());
         assert!(limits.write_enabled());
+        assert_eq!(limits.mutation_mode(), MutationMode::HumanApproved);
+        assert!(limits.allows_prepare());
+        assert!(limits.allows_human_mutation());
+        let prepare_only = limits.clone().with_mutation_mode(MutationMode::PrepareOnly);
+        assert!(prepare_only.allows_prepare());
+        assert!(!prepare_only.allows_human_mutation());
+        let read_only = limits.read_only();
+        assert_eq!(read_only.mutation_mode(), MutationMode::ReadOnly);
+        assert!(!read_only.allows_prepare());
+        assert!(
+            !read_only
+                .with_mutation_mode(MutationMode::HumanApproved)
+                .allows_prepare()
+        );
         assert_eq!(limits.max_file_size_bytes(), 1_048_576);
         assert_eq!(limits.max_response_bytes(), 262_144);
         assert_eq!(limits.max_directory_entries(), 1_000);

@@ -727,6 +727,7 @@ fn push_summary(out: &mut String, config_path: &Path, config: &AgentConfig) {
         },
     );
     push_line(out, "require_write_approval", "true");
+    push_line(out, "mutation_mode", config.mutation_mode().as_str());
     push_line(
         out,
         "max_file_size_bytes",

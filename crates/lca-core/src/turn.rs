@@ -505,7 +505,7 @@ impl SingleTurnAgentController {
         match tool.permission() {
             PermissionCategory::Diagnostic => false,
             PermissionCategory::WorkspaceRead => self.limits.read_enabled(),
-            PermissionCategory::WorkspaceMutation => self.limits.write_enabled(),
+            PermissionCategory::WorkspaceMutation => self.limits.allows_prepare(),
         }
     }
 

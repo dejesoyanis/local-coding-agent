@@ -282,7 +282,7 @@ impl ProposalStore {
         fault: ApplyFault,
         hold: Option<&KillHold>,
     ) -> Result<ApplyResult, FsError> {
-        if !limits.write_enabled() {
+        if !limits.allows_human_mutation() {
             return Err(FsError::ToolDisabled {
                 tool: "apply_patch".to_owned(),
             });
@@ -384,7 +384,8 @@ impl ProposalStore {
             record.state = RestorationState::Restoring;
             self.write_restoration(workspace, record)?;
             self.audit_restoration(workspace, "restoration_started", record)?;
-            let prepared = image_from(sandbox, record)?;
+            let mut prepared = image_from(sandbox, record)?;
+            prepared.authorize_mutation();
             let grant = crate::fs::ApprovalGrant::issue_restoration(&prepared, line, &expected)?;
             let sealed = RefCell::new(None);
             let outcome = {

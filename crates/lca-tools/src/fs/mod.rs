@@ -16,7 +16,7 @@ use crate::sandbox::WorkspaceSandbox;
 pub use limits::{
     DEFAULT_MAX_DIRECTORY_ENTRIES, DEFAULT_MAX_FILE_SIZE_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_MAX_SEARCH_FILES, DEFAULT_MAX_SEARCH_MATCHES, DEFAULT_MAX_SEARCH_TOTAL_BYTES,
-    FsLimitValues, FsLimits,
+    FsLimitValues, FsLimits, MutationMode,
 };
 pub use list::{DirectoryEntry, ListResult};
 pub use patch::{ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, KillHold, PreparedPatch};

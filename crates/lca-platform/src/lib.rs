@@ -13,6 +13,9 @@ use std::path::Path;
 mod sys;
 
 #[cfg(all(test, windows))]
+#[allow(clippy::too_many_lines)]
+mod isolation_probe;
+#[cfg(all(test, windows))]
 mod publication_probe;
 
 /// Identity of one filesystem object, taken from an open handle.

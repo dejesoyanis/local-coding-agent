@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::fs::limits::FsLimits;
+use crate::fs::limits::{FsLimits, MutationMode};
 use crate::fs::read::privacy_gate;
 use crate::fs_error::{FsError, display_path};
 use crate::pathutil::paths_equivalent;
@@ -119,6 +119,9 @@ pub struct PreparedPatch {
     diff: String,
     binding: [u8; 32],
     line_ending: &'static str,
+    /// Trusted mode captured at prepare time. A restored proposal starts as read-only
+    /// until the approval path explicitly authorizes a human mutation.
+    mutation_mode: MutationMode,
 }
 
 impl fmt::Debug for PreparedPatch {
@@ -218,6 +221,14 @@ impl PreparedPatch {
         self.identity
     }
 
+    /// Records that a trusted approval path accepted a human mutation.
+    ///
+    /// Callers must already have checked [`FsLimits::allows_human_mutation`]. The model
+    /// has no method that reaches this function.
+    pub(crate) fn authorize_mutation(&mut self) {
+        self.mutation_mode = MutationMode::HumanApproved;
+    }
+
     /// Exact line the user must type to approve this action in-process.
     #[must_use]
     pub fn confirmation_line(&self) -> String {
@@ -245,7 +256,7 @@ pub(crate) fn prepare_patch(
     path: &str,
     patch: &str,
 ) -> Result<PreparedPatch, FsError> {
-    if !limits.write_enabled() {
+    if !limits.allows_prepare() {
         return Err(FsError::ToolDisabled {
             tool: "apply_patch".to_owned(),
         });
@@ -314,6 +325,7 @@ pub(crate) fn prepare_patch(
         diff,
         binding,
         line_ending: ending.label(),
+        mutation_mode: limits.mutation_mode(),
     })
 }
 
@@ -467,6 +479,11 @@ pub(crate) fn apply_granted_controlled(
     preimage: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
     audit: &mut dyn FnMut(&str) -> Result<(), FsError>,
 ) -> Result<ApplyResult, FsError> {
+    if prepared.mutation_mode != MutationMode::HumanApproved {
+        return Err(FsError::ToolDisabled {
+            tool: "apply_patch".to_owned(),
+        });
+    }
     if grant.action_id != prepared.action_id || grant.binding != prepared.binding {
         return Err(FsError::ApprovalMismatch);
     }
@@ -626,6 +643,11 @@ pub(crate) fn apply_image_controlled(
     preimage: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
     audit: &mut dyn FnMut(&str) -> Result<(), FsError>,
 ) -> Result<ApplyResult, FsError> {
+    if prepared.mutation_mode != MutationMode::HumanApproved {
+        return Err(FsError::ToolDisabled {
+            tool: "apply_patch".to_owned(),
+        });
+    }
     if !prepared.patch_text.starts_with(RESTORATION_IMAGE_MARKER) {
         return Err(FsError::ApprovalMismatch);
     }
@@ -1402,6 +1424,7 @@ pub(crate) fn restore_prepared(stored: StoredPatch) -> PreparedPatch {
         diff: stored.diff,
         binding,
         line_ending: stored.line_ending,
+        mutation_mode: MutationMode::ReadOnly,
     }
 }
 

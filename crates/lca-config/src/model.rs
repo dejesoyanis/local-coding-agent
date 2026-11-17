@@ -81,6 +81,32 @@ pub const MAX_STEPS: u32 = 10_000;
 /// Largest accepted configuration file, in bytes.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
+/// Filesystem mutation allowed by trusted configuration.
+///
+/// A missing `tools.mutation_mode` is [`Self::ReadOnly`]. The model cannot set this value.
+/// `write_enabled` does not raise it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationMode {
+    /// Reads only.
+    ReadOnly,
+    /// Prepare and review a patch. Do not apply it.
+    PrepareOnly,
+    /// Apply and restore only after a separate human confirmation.
+    HumanApproved,
+}
+
+impl MutationMode {
+    /// Configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::PrepareOnly => "prepare_only",
+            Self::HumanApproved => "human_approved",
+        }
+    }
+}
+
 /// Largest accepted model name, in bytes.
 pub const MAX_MODEL_NAME_LEN: usize = 256;
 
@@ -128,6 +154,7 @@ pub struct AgentConfig {
     connect_timeout: Duration,
     tool_read_enabled: bool,
     tool_write_enabled: bool,
+    mutation_mode: MutationMode,
     tool_max_file_size_bytes: u64,
     tool_max_response_bytes: u64,
     tool_max_directory_entries: usize,
@@ -170,6 +197,8 @@ pub struct ConfigSummary {
     pub tool_read_enabled: bool,
     /// Whether patch preparation is enabled. Application still requires approval.
     pub tool_write_enabled: bool,
+    /// Trusted mutation mode. Missing configuration is `read_only`.
+    pub mutation_mode: String,
     /// Write approval cannot be turned off.
     pub require_write_approval: bool,
     /// Maximum file size in bytes.
@@ -222,6 +251,7 @@ impl AgentConfig {
             connect_timeout: limits.connect_timeout,
             tool_read_enabled: tools.read_enabled,
             tool_write_enabled: tools.write_enabled,
+            mutation_mode: tools.mutation_mode,
             tool_max_file_size_bytes: tools.max_file_size_bytes,
             tool_max_response_bytes: tools.max_response_bytes,
             tool_max_directory_entries: tools.max_directory_entries,
@@ -308,6 +338,12 @@ impl AgentConfig {
     #[must_use]
     pub const fn tool_write_enabled(&self) -> bool {
         self.tool_write_enabled
+    }
+
+    /// Mutation mode loaded from configuration. This is not a model output.
+    #[must_use]
+    pub const fn mutation_mode(&self) -> MutationMode {
+        self.mutation_mode
     }
 
     /// Always true. Configuration cannot disable write approval.
@@ -414,6 +450,7 @@ impl AgentConfig {
             connect_timeout_secs: self.connect_timeout.as_secs(),
             tool_read_enabled: self.tool_read_enabled,
             tool_write_enabled: self.tool_write_enabled,
+            mutation_mode: self.mutation_mode.as_str().to_owned(),
             require_write_approval: true,
             tool_max_file_size_bytes: self.tool_max_file_size_bytes,
             tool_max_response_bytes: self.tool_max_response_bytes,
@@ -480,6 +517,7 @@ pub(crate) struct RawAgent {
 pub(crate) struct RawTools {
     pub(crate) read_enabled: Option<bool>,
     pub(crate) write_enabled: Option<bool>,
+    pub(crate) mutation_mode: Option<String>,
     pub(crate) require_write_approval: Option<bool>,
     pub(crate) max_file_size_bytes: Option<u64>,
     pub(crate) max_response_bytes: Option<u64>,
@@ -494,6 +532,7 @@ pub(crate) struct RawTools {
 pub(crate) struct ResolvedTools {
     pub(crate) read_enabled: bool,
     pub(crate) write_enabled: bool,
+    pub(crate) mutation_mode: MutationMode,
     pub(crate) max_file_size_bytes: u64,
     pub(crate) max_response_bytes: u64,
     pub(crate) max_directory_entries: usize,
@@ -738,9 +777,22 @@ pub(crate) fn resolve_tools(raw: &RawTools) -> Result<ResolvedTools, ConfigError
         max_file_size_bytes,
         "tools.max_response_bytes",
     )?;
+    let mutation_mode = match raw.mutation_mode.as_deref() {
+        None => MutationMode::ReadOnly,
+        Some("read_only") => MutationMode::ReadOnly,
+        Some("prepare_only") => MutationMode::PrepareOnly,
+        Some("human_approved") => MutationMode::HumanApproved,
+        Some(_) => {
+            return Err(ConfigError::InvalidValue {
+                field: "tools.mutation_mode",
+                message: "must be read_only, prepare_only, or human_approved".to_owned(),
+            });
+        }
+    };
     Ok(ResolvedTools {
         read_enabled: raw.read_enabled.unwrap_or(true),
         write_enabled: raw.write_enabled.unwrap_or(true),
+        mutation_mode,
         max_file_size_bytes,
         max_response_bytes,
         max_directory_entries: bounded_count(

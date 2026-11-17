@@ -331,6 +331,7 @@ mod tests {
         );
         assert!(config.tool_read_enabled());
         assert!(config.tool_write_enabled());
+        assert_eq!(config.mutation_mode(), crate::MutationMode::ReadOnly);
         assert!(config.require_write_approval());
         assert_eq!(
             config.tool_max_file_size_bytes(),
@@ -375,6 +376,7 @@ mod tests {
         let config = load_from_path(&explicit).expect("explicit");
         assert!(!config.tool_read_enabled());
         assert!(config.tool_write_enabled());
+        assert_eq!(config.mutation_mode(), crate::MutationMode::ReadOnly);
         assert!(config.require_write_approval());
         assert_eq!(config.tool_max_file_size_bytes(), 128);
         assert_eq!(config.tool_max_response_bytes(), 64);
@@ -383,6 +385,42 @@ mod tests {
         assert_eq!(config.tool_max_search_files(), 5);
         assert_eq!(config.tool_max_search_total_bytes(), 256);
         assert!(config.privacy_excludes().is_empty());
+    }
+
+    #[test]
+    fn mutation_mode_defaults_closed_and_rejects_an_unknown_name() {
+        let root = TempDir::new("mode");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let base = toml_path(&workspace);
+        let missing = write_config(root.path(), &format!("workspace_root = '{base}'\n"));
+        let config = load_from_path(&missing).expect("missing");
+        assert_eq!(config.mutation_mode().as_str(), "read_only");
+        assert!(config.tool_write_enabled());
+
+        let prepare = write_config(
+            root.path(),
+            &format!("workspace_root = '{base}'\n[tools]\nmutation_mode = 'prepare_only'\n"),
+        );
+        assert_eq!(
+            load_from_path(&prepare).expect("prepare").mutation_mode(),
+            crate::MutationMode::PrepareOnly
+        );
+        let approved = write_config(
+            root.path(),
+            &format!("workspace_root = '{base}'\n[tools]\nmutation_mode = 'human_approved'\n"),
+        );
+        assert_eq!(
+            load_from_path(&approved).expect("approved").mutation_mode(),
+            crate::MutationMode::HumanApproved
+        );
+        let invalid = write_config(
+            root.path(),
+            &format!("workspace_root = '{base}'\n[tools]\nmutation_mode = 'unrestricted'\n"),
+        );
+        let error = load_from_path(&invalid).expect_err("invalid");
+        assert_eq!(error.kind(), "invalid_value");
+        assert!(error.to_string().contains("mutation_mode"), "{error}");
     }
 
     #[test]

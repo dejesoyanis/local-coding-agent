@@ -10,7 +10,7 @@ use lca_config::{AgentConfig, load_from_path};
 use lca_core::{WriteConfirmation, commit_prepared, dispatch_validated};
 use lca_tools::{
     ActionIdFactory, ActionSource, ApprovalLedger, FsError, FsLimitValues, FsLimits, FsOutcome,
-    PrivacyPolicy, ToolRegistry, WorkspaceSandbox, propose_actions, validate_batch,
+    MutationMode, PrivacyPolicy, ToolRegistry, WorkspaceSandbox, propose_actions, validate_batch,
 };
 use serde_json::{Value, json};
 
@@ -197,7 +197,12 @@ pub(crate) fn sandbox_from(config: &AgentConfig) -> Result<WorkspaceSandbox, Str
 }
 
 pub(crate) fn limits_from(config: &AgentConfig) -> Result<FsLimits, String> {
-    FsLimits::try_new(FsLimitValues {
+    let mode = match config.mutation_mode() {
+        lca_config::MutationMode::ReadOnly => MutationMode::ReadOnly,
+        lca_config::MutationMode::PrepareOnly => MutationMode::PrepareOnly,
+        lca_config::MutationMode::HumanApproved => MutationMode::HumanApproved,
+    };
+    let limits = FsLimits::try_new(FsLimitValues {
         read_enabled: config.tool_read_enabled(),
         write_enabled: config.tool_write_enabled(),
         max_file_size_bytes: config.tool_max_file_size_bytes(),
@@ -207,7 +212,8 @@ pub(crate) fn limits_from(config: &AgentConfig) -> Result<FsLimits, String> {
         max_search_files: config.tool_max_search_files(),
         max_search_total_bytes: config.tool_max_search_total_bytes(),
     })
-    .map_err(|error: FsError| error.to_string())
+    .map_err(|error: FsError| error.to_string())?;
+    Ok(limits.with_mutation_mode(mode))
 }
 
 fn render_outcome(outcome: FsOutcome) -> CommandOutput {
@@ -339,7 +345,13 @@ mod tests {
         .expect("diff");
         let config = root.0.join("lca.toml");
         let workspace_text = workspace.display().to_string().replace('\\', "/");
-        std::fs::write(&config, format!("workspace_root = '{workspace_text}'\n")).expect("config");
+        std::fs::write(
+            &config,
+            format!(
+                "workspace_root = '{workspace_text}'\n[tools]\nmutation_mode = 'human_approved'\n"
+            ),
+        )
+        .expect("config");
 
         let mut rejected_out = Vec::new();
         let mut rejected_err = Vec::new();

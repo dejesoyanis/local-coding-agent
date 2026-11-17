@@ -347,7 +347,7 @@ impl ProposalStore {
         fault: ApplyFault,
         hold: Option<&KillHold>,
     ) -> Result<ApplyResult, FsError> {
-        if !limits.write_enabled() {
+        if !limits.allows_human_mutation() {
             return Err(FsError::ToolDisabled {
                 tool: "apply_patch".to_owned(),
             });
@@ -406,7 +406,8 @@ impl ProposalStore {
             record.state = State::Applying;
             self.write_record(workspace, record)?;
             self.audit(workspace, "apply_started", record)?;
-            let prepared = record.to_prepared(sandbox)?;
+            let mut prepared = record.to_prepared(sandbox)?;
+            prepared.authorize_mutation();
             let grant = ApprovalGrant::issue(&prepared, &prepared.confirmation_line())?;
             let sealed = RefCell::new(None);
             let outcome = {

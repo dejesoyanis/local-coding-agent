@@ -79,7 +79,7 @@ fn prepare_and_save(root: &Path, old: &str, new: &str) -> String {
 fn config_for(root: &Path) -> PathBuf {
     let config = root.join("lca.toml");
     let body = format!(
-        "workspace_root = '{}'\n",
+        "workspace_root = '{}'\n[tools]\nmutation_mode = 'human_approved'\n",
         root.display().to_string().replace('\\', "/")
     );
     fs::write(&config, body).expect("config");

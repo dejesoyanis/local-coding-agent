@@ -1290,7 +1290,7 @@ fn advertise(tool: &lca_tools::RegisteredTool, limits: &FsLimits) -> bool {
     match tool.permission() {
         PermissionCategory::Diagnostic => false,
         PermissionCategory::WorkspaceRead => limits.read_enabled(),
-        PermissionCategory::WorkspaceMutation => limits.write_enabled(),
+        PermissionCategory::WorkspaceMutation => limits.allows_prepare(),
     }
 }
 

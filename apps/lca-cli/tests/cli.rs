@@ -280,6 +280,12 @@ fn serve_once(status: u16, body: &str) -> (String, Arc<Mutex<String>>) {
     (format!("http://{address}"), captured)
 }
 
+fn grant_human_mutation(config: &Path) {
+    let mut body = fs::read_to_string(config).expect("config");
+    body.push_str("\n[tools]\nmutation_mode = 'human_approved'\n");
+    fs::write(config, body).expect("mode");
+}
+
 fn write_endpoint_config(workspace: &Path, endpoint: &str, timeout: u64) -> PathBuf {
     let config = workspace.join("lca.toml");
     let body = format!(
@@ -581,6 +587,7 @@ fn filesystem_commands_stay_inside_the_workspace() {
     let combined = format!("{}{}", text(&outside.stdout), text(&outside.stderr));
     assert!(!combined.contains("alpha"), "{combined}");
 
+    grant_human_mutation(Path::new(config));
     let flagged = run(&[
         "tools",
         "patch",
@@ -693,13 +700,18 @@ fn agent_run_reads_a_file_from_one_native_model_call() {
     assert!(requests[1].contains("POST /api/chat"), "{}", requests[1]);
     assert!(requests[1].contains("\"stream\":false"), "{}", requests[1]);
     assert!(!requests[1].contains("\"format\""), "{}", requests[1]);
-    for name in ["list_directory", "read_file", "search_files", "apply_patch"] {
+    for name in ["list_directory", "read_file", "search_files"] {
         assert!(
             requests[1].contains(name),
             "{name} missing in {}",
             requests[1]
         );
     }
+    assert!(
+        !requests[1].contains("apply_patch"),
+        "read_only must not advertise apply_patch: {}",
+        requests[1]
+    );
     assert!(!requests[1].contains("diagnostic_echo"), "{}", requests[1]);
     assert!(!requests[1].contains("execute_command"), "{}", requests[1]);
 }
@@ -750,6 +762,7 @@ fn agent_run_prepares_a_patch_without_writing() {
         ("POST /api/chat", 200, &chat),
     ]);
     let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    grant_human_mutation(&config);
     let output = run(&[
         "agent",
         "run",
@@ -1178,6 +1191,7 @@ fn agent_execute_prepares_a_patch_without_offering_a_later_grant() {
         ("POST /api/chat", 200, &chat),
     ]);
     let config = write_endpoint_config(workspace.path(), &endpoint, 5);
+    grant_human_mutation(&config);
     let output = run(&[
         "agent",
         "execute",
