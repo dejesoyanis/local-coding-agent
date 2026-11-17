@@ -14,6 +14,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+lca-platform = { path = "../lca-platform" }
 proptest = "1"
 
 [lints]

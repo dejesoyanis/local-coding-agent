@@ -793,6 +793,7 @@ fn publish_handle(
     if truncated == 0 {
         return Err(io_code());
     }
+    hook(PublishPhase::BeforeFlush)?;
     flush_handle(handle)
 }
 

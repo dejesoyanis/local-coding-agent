@@ -59,6 +59,7 @@ fn killed_child_is_recovered_without_a_rewrite() {
         ("after_stage_flush", "alpha\n", "failed"),
         ("before_rename", "alpha\n", "failed"),
         ("during_publish", "torn", "unclear"),
+        ("before_flush", "beta\n", "applied"),
         ("after_rename", "beta\n", "applied"),
         ("before_readback", "beta\n", "applied"),
         ("after_verification", "beta\n", "applied"),

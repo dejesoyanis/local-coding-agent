@@ -258,6 +258,15 @@ pub enum FsError {
     #[error("patch proposal has expired")]
     ProposalExpired,
 
+    /// A restoration contract, its evidence, or its source state was rejected.
+    ///
+    /// The message is static. It does not include file bytes.
+    #[error("restoration was rejected: {message}")]
+    RestorationRejected {
+        /// Static explanation.
+        message: String,
+    },
+
     /// This platform cannot verify an apply.
     #[error("verified patch apply is not supported on this platform")]
     UnsupportedPlatform,
@@ -323,6 +332,7 @@ impl FsError {
             Self::LedgerUnavailable => "ledger_unavailable",
             Self::ProposalInvalid { .. } => "proposal_invalid",
             Self::ProposalExpired => "proposal_expired",
+            Self::RestorationRejected { .. } => "restoration_rejected",
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::WorkspaceMismatch => "workspace_mismatch",
             Self::StoreUnavailable { .. } => "store_unavailable",

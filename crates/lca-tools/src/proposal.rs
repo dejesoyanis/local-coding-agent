@@ -22,6 +22,10 @@ use crate::fs_error::FsError;
 use crate::pathutil::paths_equivalent;
 use crate::sandbox::{FileIdentity, WorkspaceSandbox};
 
+mod restoration;
+
+pub use restoration::{RestorationSummary, RestorationView};
+
 const CONTRACT_VERSION: u32 = 1;
 const TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_PATH: usize = 4096;
@@ -932,6 +936,22 @@ impl Evidence {
         }
     }
 
+    /// Hash of the immutable preimage. Phase and recovery flags are not included.
+    fn source_digest(&self) -> [u8; 32] {
+        let mut body = Vec::new();
+        push_part(&mut body, b"LCA-01J-EVIDENCE-SOURCE-V1");
+        push_part(&mut body, self.proposal_id.as_bytes());
+        push_part(&mut body, &self.digest);
+        push_part(&mut body, self.attempt_id.as_bytes());
+        push_part(&mut body, &[self.strategy]);
+        push_part(&mut body, &self.target_volume.to_le_bytes());
+        push_part(&mut body, &self.file_id_before);
+        push_part(&mut body, &self.original_hash);
+        push_part(&mut body, &self.proposed_hash);
+        push_part(&mut body, &self.original);
+        sha256(&body)
+    }
+
     fn encode(&self) -> Result<Vec<u8>, FsError> {
         if sha256(&self.original) != self.original_hash {
             return Err(FsError::StoreUnavailable {
@@ -1135,7 +1155,7 @@ fn next_step(_state: State, observed: &str) -> &'static str {
             "the original bytes are still on the approved file id; a new proposal and a new approval are required before another write"
         }
         "matches_neither" => {
-            "the file matches neither hash; the sealed preimage is in the proposal store; restoring it requires a new proposal and a new approval"
+            "the file matches neither hash; the sealed preimage is in the proposal store; lca patch restoration prepare creates a new restoration that needs its own approval"
         }
         "identity_differs" => {
             "the open file id is not the approved object; this approval will not be reused"
@@ -2004,6 +2024,7 @@ mod tests {
             ApplyFault::DuringPublish,
             ApplyFault::AfterRename,
             ApplyFault::BeforeReadback,
+            ApplyFault::BeforeFlush,
             ApplyFault::DuringReadback,
             ApplyFault::AfterVerification,
             ApplyFault::BeforeAudit,
@@ -2095,6 +2116,7 @@ mod tests {
                 }
                 ApplyFault::AfterRename
                 | ApplyFault::BeforeReadback
+                | ApplyFault::BeforeFlush
                 | ApplyFault::DuringReadback => {
                     assert_eq!(bytes, b"beta\n", "{fault:?} {error}");
                     if fault == ApplyFault::DuringReadback {

@@ -3,7 +3,8 @@
 //! [`action`] validates structured tool calls and does not execute them.
 //! [`executor`] still refuses the LCA-01A tool requests. [`fs`] runs the filesystem
 //! tools after that validation, inside [`sandbox`]. `apply_patch` prepares bytes in
-//! memory; only [`fs::apply_granted`] writes, and only with an approval grant.
+//! memory. [`fs::apply_granted`] writes a reviewed patch. A restoration uses the same
+//! NTFS publisher after a separate restoration grant.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -40,5 +41,8 @@ pub use fs::{
 pub use fs_error::FsError;
 pub use model::{ToolArguments, ToolName, ToolRequest, ToolResult};
 pub use privacy::{PrivacyPatternError, PrivacyPolicy, deny_overrides};
-pub use proposal::{ProposalInspection, ProposalStore, ProposalSummary, ProposalView};
+pub use proposal::{
+    ProposalInspection, ProposalStore, ProposalSummary, ProposalView, RestorationSummary,
+    RestorationView,
+};
 pub use sandbox::{ResolvedKind, ResolvedPath, WorkspaceSandbox};

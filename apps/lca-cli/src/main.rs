@@ -14,7 +14,25 @@ fn main() -> ExitCode {
         lca_cli::Invocation::Ask(command) => stream_ask(command),
         lca_cli::Invocation::Patch(command) => confirm_patch(command),
         lca_cli::Invocation::ProposalApprove(command) => approve_proposal(command),
+        lca_cli::Invocation::RestorationApprove(command) => approve_restoration(command),
     }
+}
+
+fn approve_restoration(command: lca_cli::RestorationApproveCommand) -> ExitCode {
+    if !io::stdin().is_terminal() {
+        let _ = writeln!(
+            io::stderr(),
+            "lca: restoration approval requires an interactive console"
+        );
+        return ExitCode::from(1);
+    }
+    let code = lca_cli::run_restoration_approve(
+        &command,
+        &mut io::stdin().lock(),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    );
+    ExitCode::from(code)
 }
 
 fn approve_proposal(command: lca_cli::ProposalApproveCommand) -> ExitCode {

@@ -170,6 +170,8 @@ pub enum PublishPhase {
     BeforeRename,
     /// At least one `WriteFile` to the target has returned. The file may be partial.
     DuringPublish,
+    /// `SetEndOfFile` has returned. `FlushFileBuffers` has not been called.
+    BeforeFlush,
     /// The target handle has the new bytes and they have been flushed.
     AfterRename,
     /// The handle is about to be read back.

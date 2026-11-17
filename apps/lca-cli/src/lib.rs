@@ -66,6 +66,8 @@ pub enum Invocation {
     Patch(PatchCommand),
     /// A stored proposal that must be confirmed on an interactive console.
     ProposalApprove(patch_cmd::ProposalApproveCommand),
+    /// A stored restoration that must be confirmed on an interactive console.
+    RestorationApprove(patch_cmd::RestorationApproveCommand),
 }
 
 /// Arguments for `lca tools patch prepare`.
@@ -180,6 +182,29 @@ where
                     id,
                 })
             }
+            ProposalCli::Restoration { action } => match action {
+                RestorationCli::Prepare { id } => {
+                    Invocation::Buffered(patch_cmd::run_restoration_prepare(&config_path, &id))
+                }
+                RestorationCli::Show { id } => {
+                    Invocation::Buffered(patch_cmd::run_restoration_show(&config_path, &id))
+                }
+                RestorationCli::Status { id } => {
+                    Invocation::Buffered(patch_cmd::run_restoration_status(&config_path, &id))
+                }
+                RestorationCli::Recover { id } => {
+                    Invocation::Buffered(patch_cmd::run_restoration_recover(&config_path, &id))
+                }
+                RestorationCli::Reject { id } => {
+                    Invocation::Buffered(patch_cmd::run_restoration_reject(&config_path, &id))
+                }
+                RestorationCli::Approve { id } => {
+                    Invocation::RestorationApprove(patch_cmd::RestorationApproveCommand {
+                        config: config_path,
+                        id,
+                    })
+                }
+            },
         },
         Command::Tools { action } => match action {
             ToolsAction::Probe { protocol } => {
@@ -233,11 +258,19 @@ where
             stdout: String::new(),
             stderr: "lca: patch approve is confirmed by the lca binary\n".to_owned(),
         },
+        Invocation::RestorationApprove(_) => CommandOutput {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: "lca: patch restoration approve is confirmed by the lca binary\n".to_owned(),
+        },
     }
 }
 
 pub use ask::run_ask;
-pub use patch_cmd::{ProposalApproveCommand, run_proposal_approve};
+pub use patch_cmd::{
+    ProposalApproveCommand, RestorationApproveCommand, run_proposal_approve,
+    run_restoration_approve,
+};
 pub use tools_cmd::run_patch_session;
 
 #[derive(Debug, Parser)]
@@ -397,6 +430,45 @@ enum ProposalCli {
     /// Reconcile and print one proposal state. This does not write the target.
     Status {
         /// Proposal UUID.
+        id: String,
+    },
+    /// Prepare or review a restoration. Approval reads an interactive console.
+    Restoration {
+        #[command(subcommand)]
+        action: RestorationCli,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RestorationCli {
+    /// Bind a new restoration to sealed publication evidence. This does not write the target.
+    Prepare {
+        /// Source proposal UUID.
+        id: String,
+    },
+    /// Show one restoration, including the diff and the confirmation line.
+    Show {
+        /// Restoration UUID.
+        id: String,
+    },
+    /// Restore one file after an interactive confirmation line.
+    Approve {
+        /// Restoration UUID.
+        id: String,
+    },
+    /// Mark one prepared restoration rejected. This does not write the target.
+    Reject {
+        /// Restoration UUID.
+        id: String,
+    },
+    /// Reconcile and print one restoration state. This does not write the target.
+    Status {
+        /// Restoration UUID.
+        id: String,
+    },
+    /// Reconcile one restoration from the target bytes. This does not write the target.
+    Recover {
+        /// Restoration UUID.
         id: String,
     },
 }

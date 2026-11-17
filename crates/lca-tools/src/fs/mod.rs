@@ -1,7 +1,7 @@
 //! Filesystem tools that run only after LCA-01C validation.
 //!
-//! [`execute_validated`] never writes. [`apply_granted`] is the only write path, and it
-//! requires an [`ApprovalGrant`] issued for that exact prepared patch.
+//! [`execute_validated`] never writes. [`apply_granted`] writes one reviewed patch.
+//! Restoration uses `apply_image_controlled`, which calls that same NTFS publisher.
 
 mod limits;
 mod list;
@@ -20,7 +20,10 @@ pub use limits::{
 };
 pub use list::{DirectoryEntry, ListResult};
 pub use patch::{ApplyFault, ApplyResult, ApprovalGrant, ApprovalLedger, KillHold, PreparedPatch};
-pub(crate) use patch::{BoundFileId, StoredPatch, apply_granted_controlled, restore_prepared};
+pub(crate) use patch::{
+    BoundFileId, RESTORATION_IMAGE_MARKER, StoredPatch, apply_granted_controlled,
+    apply_image_controlled, restore_prepared,
+};
 pub use read::ReadResult;
 pub use search::{SearchMatch, SearchResult};
 

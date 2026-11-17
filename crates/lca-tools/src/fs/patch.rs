@@ -66,7 +66,34 @@ impl ApprovalGrant {
             binding: prepared.binding,
         })
     }
+
+    /// Issues the in-process binding for a restoration image.
+    ///
+    /// `expected` is the restoration confirmation line. A patch approval line is rejected.
+    /// This does not write.
+    pub(crate) fn issue_restoration(
+        prepared: &PreparedPatch,
+        line: &str,
+        expected: &str,
+    ) -> Result<Self, FsError> {
+        if !expected.starts_with("restore ")
+            || line != expected
+            || line.starts_with("approve ")
+            || expected.starts_with("approve ")
+        {
+            return Err(FsError::ApprovalRejected);
+        }
+        if !prepared.patch_text.starts_with(RESTORATION_IMAGE_MARKER) {
+            return Err(FsError::ApprovalMismatch);
+        }
+        Ok(Self {
+            action_id: prepared.action_id,
+            binding: prepared.binding,
+        })
+    }
 }
+
+pub(crate) const RESTORATION_IMAGE_MARKER: &str = "LCA-01J-RESTORATION-IMAGE\n";
 
 /// NTFS file id captured at prepare time. Zeros mean this platform has no file id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +338,8 @@ pub enum ApplyFault {
     BeforeRename,
     /// After the first target `WriteFile` and before the file length is adjusted.
     DuringPublish,
+    /// After `SetEndOfFile` and before `FlushFileBuffers`.
+    BeforeFlush,
     /// Immediately after the verified handle has been flushed.
     AfterRename,
     /// Before the handle is read back.
@@ -341,6 +370,7 @@ impl ApplyFault {
             Self::AfterStageFlush => "after_stage_flush",
             Self::BeforeRename => "before_rename",
             Self::DuringPublish => "during_publish",
+            Self::BeforeFlush => "before_flush",
             Self::AfterRename => "after_rename",
             Self::BeforeReadback => "before_readback",
             Self::DuringReadback => "during_readback",
@@ -361,6 +391,7 @@ impl ApplyFault {
             "after_stage_flush" => Self::AfterStageFlush,
             "before_rename" => Self::BeforeRename,
             "during_publish" => Self::DuringPublish,
+            "before_flush" => Self::BeforeFlush,
             "after_rename" => Self::AfterRename,
             "before_readback" => Self::BeforeReadback,
             "during_readback" => Self::DuringReadback,
@@ -577,6 +608,67 @@ pub(crate) fn apply_granted_controlled(
             path: prepared.relative_path.clone(),
             new_hash: hex_encode(&prepared.new_hash),
         })
+    }
+}
+
+/// Writes `prepared.new_bytes` through [`apply_ntfs`].
+///
+/// The image marker is required. A unified diff is not replayed and is not accepted here.
+/// Non-Windows builds refuse the call instead of using the rename publisher.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_image_controlled(
+    sandbox: &WorkspaceSandbox,
+    prepared: &PreparedPatch,
+    grant: ApprovalGrant,
+    ledger: &ApprovalLedger,
+    fault: ApplyFault,
+    hold: Option<&KillHold>,
+    preimage: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
+    audit: &mut dyn FnMut(&str) -> Result<(), FsError>,
+) -> Result<ApplyResult, FsError> {
+    if !prepared.patch_text.starts_with(RESTORATION_IMAGE_MARKER) {
+        return Err(FsError::ApprovalMismatch);
+    }
+    if grant.action_id != prepared.action_id || grant.binding != prepared.binding {
+        return Err(FsError::ApprovalMismatch);
+    }
+    if sha256(prepared.patch_text.as_bytes()) != prepared.patch_hash
+        || sha256(&prepared.new_bytes) != prepared.new_hash
+    {
+        return Err(FsError::ApprovalMismatch);
+    }
+    if !paths_equivalent(sandbox.root(), &prepared.workspace_root) {
+        return Err(FsError::ApprovalMismatch);
+    }
+    deny_overrides(&[privacy_gate(sandbox, &prepared.relative_path)])?;
+    let used = ledger.used.lock().map_err(|_| FsError::LedgerUnavailable)?;
+    if used.contains(&prepared.binding) {
+        return Err(FsError::ApprovalConsumed);
+    }
+    let resolved = sandbox.resolve(&prepared.relative_path)?;
+    if !resolved.is_file() {
+        return Err(FsError::NotAFile {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    if resolved.identity() != prepared.identity {
+        return Err(FsError::IdentityChanged {
+            path: prepared.relative_path.clone(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let mut used = used;
+        apply_ntfs(prepared, &mut used, fault, hold, preimage, audit)?;
+        Ok(ApplyResult {
+            path: prepared.relative_path.clone(),
+            new_hash: hex_encode(&prepared.new_hash),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (fault, hold, preimage, audit, used, resolved);
+        Err(FsError::UnsupportedPlatform)
     }
 }
 
@@ -1125,6 +1217,7 @@ fn apply_ntfs(
         let event = match phase {
             lca_platform::PublishPhase::AfterStageFlush => Some("stage_flushed"),
             lca_platform::PublishPhase::BeforeRename => Some("mutation_started"),
+            lca_platform::PublishPhase::BeforeFlush => None,
             lca_platform::PublishPhase::AfterRename => Some("mutation_published"),
             _ => None,
         };
@@ -1177,6 +1270,7 @@ fn fault_phase(phase: lca_platform::PublishPhase) -> ApplyFault {
         lca_platform::PublishPhase::AfterStageFlush => ApplyFault::AfterStageFlush,
         lca_platform::PublishPhase::BeforeRename => ApplyFault::BeforeRename,
         lca_platform::PublishPhase::DuringPublish => ApplyFault::DuringPublish,
+        lca_platform::PublishPhase::BeforeFlush => ApplyFault::BeforeFlush,
         lca_platform::PublishPhase::AfterRename => ApplyFault::AfterRename,
         lca_platform::PublishPhase::BeforeReadback => ApplyFault::BeforeReadback,
         lca_platform::PublishPhase::DuringReadback => ApplyFault::DuringReadback,
@@ -1201,6 +1295,9 @@ fn fault_matches(fault: ApplyFault, phase: lca_platform::PublishPhase) -> bool {
         ) | (
             ApplyFault::DuringPublish,
             lca_platform::PublishPhase::DuringPublish
+        ) | (
+            ApplyFault::BeforeFlush,
+            lca_platform::PublishPhase::BeforeFlush
         ) | (
             ApplyFault::AfterRename,
             lca_platform::PublishPhase::AfterRename
