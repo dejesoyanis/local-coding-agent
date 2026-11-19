@@ -10,6 +10,7 @@
 #![allow(unsafe_code)]
 
 mod broker;
+mod cross;
 mod lifecycle;
 mod research;
 mod winutil;
@@ -32,6 +33,15 @@ fn principal_probe_child() {
         return;
     }
     let code = worker::run();
+    std::process::exit(code);
+}
+
+#[test]
+fn cross_identity_child() {
+    if std::env::var_os("LCA_01N_ROLE").is_none() {
+        return;
+    }
+    let code = cross::worker_main();
     std::process::exit(code);
 }
 
